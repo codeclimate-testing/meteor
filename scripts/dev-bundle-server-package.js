@@ -1,6 +1,5 @@
 // This file contains a package.json for the dependencies of the *BUNDLED
 // SERVER* (not the command-line tool).
-
 // We put this in a JS file so that it can contain comments. It is processed
 // into a package.json file by generate-dev-bundle.sh.
 
