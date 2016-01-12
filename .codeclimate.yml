@@ -1,0 +1,18 @@
+---
+languages:
+  JavaScript: true
+engines:
+  #coffeelint:
+  #  enabled: true
+  #duplication:
+  #  enabled: true
+  #  config:
+  #    languages:
+  #    - javascript
+  eslint:
+    enabled: true
+ratings:
+  paths:
+    #- "**.coffee"
+    - "**.js"
+exclude_paths: []
