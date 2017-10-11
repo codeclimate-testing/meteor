@@ -1,18 +1,21 @@
 Package.describe({
   summary: "Meteor's latency-compensated distributed data client",
-  version: '1.2.1',
+  version: '2.1.3',
   documentation: null
 });
 
 Npm.depends({
-  "faye-websocket": "0.9.4",
-  "permessage-deflate": "0.1.3"
+  "faye-websocket": "0.11.1",
+  "lolex": "1.4.0",
+  "permessage-deflate": "0.1.6"
 });
 
 Package.onUse(function (api) {
   api.use(['check', 'random', 'ejson', 'underscore', 'tracker',
-           'retry', 'id-map'],
+           'retry', 'id-map', 'ecmascript'],
           ['client', 'server']);
+
+  api.use('callback-hook', ['client', 'server']);
 
   // common functionality
   api.use('ddp-common', ['client', 'server']);
@@ -24,9 +27,6 @@ Package.onUse(function (api) {
   // _idParse, _idStringify.
   api.use('mongo-id', ['client', 'server']);
 
-  api.addFiles('namespace.js', ['client', 'server']);
-
-  api.addFiles('id_map.js', ['client', 'server']);
   api.addFiles(['sockjs-0.3.4.js', 'stream_client_sockjs.js'], 'client');
   api.addFiles('stream_client_nodejs.js', 'server');
   api.addFiles('stream_client_common.js', ['client', 'server']);
@@ -38,16 +38,16 @@ Package.onUse(function (api) {
 
   api.addFiles('client_convenience.js', 'client');
 
+  api.mainModule("namespace.js");
   api.export('DDP');
-  api.export('LivedataTest', {testOnly: true});
 });
-
 
 Package.onTest(function (api) {
   api.use('livedata', ['client', 'server']);
   api.use('mongo', ['client', 'server']);
   api.use('test-helpers', ['client', 'server']);
   api.use([
+    'ecmascript',
     'underscore',
     'tinytest',
     'random',

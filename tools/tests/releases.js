@@ -11,7 +11,7 @@ var DEFAULT_RELEASE_TRACK = catalog.DEFAULT_TRACK;
 // the packages from the internet. If we could fool it into using local packages
 // instead, or think that it alreayd has the packages, it would be ok). (This is
 // because it calls 'create' from a warehouse, to be specific).
-selftest.define("springboard", ['checkout', 'net'], function () {
+selftest.define("springboard", ['checkout', 'net', 'custom-warehouse'], function () {
   var s = new Sandbox({
     warehouse: {
       v1: { },
@@ -125,7 +125,7 @@ selftest.define("springboard", ['checkout', 'net'], function () {
 // the internets. (Or, to be more specific: our warehouse code tries to fetch
 // the packages from the internet. If we could fool it into using local packages
 // instead, or think that it already has the packages, it would be ok).
-selftest.define("writing versions file", ['checkout', 'net'], function () {
+selftest.define("writing versions file", ['checkout', 'net', 'custom-warehouse'], function () {
   var s = new Sandbox({
     warehouse: {
       v1: { recommended: true},
@@ -192,18 +192,20 @@ selftest.define("checkout", ['checkout'], function () {
     run.readErr("=> Running Meteor from a checkout");
     run.matchErr("project version");
     run.matchErr("(Meteor something)\n");
+    run.waitSecs(30);
     run.expectExit(0);
   });
 });
 
 
-selftest.define("download and springboard to pre-0.9.0 release", ['net', 'slow'], function () {
+selftest.define("download and springboard to pre-0.9.0 release", ['net', 'slow', 'custom-warehouse'], function () {
   var s, run;
 
-  if (files.inCheckout())
+  if (files.inCheckout()) {
     s = new Sandbox({ warehouse: { v1: { tools: 'tools1', latest: true } } });
-  else
+  } else {
     s = new Sandbox;
+  }
 
   // End-to-end, online test of downloading and springboarding. This
   // release was built from the
@@ -222,7 +224,7 @@ selftest.define("download and springboard to pre-0.9.0 release", ['net', 'slow']
 });
 
 
-selftest.define("unknown release", [], function () {
+selftest.define("unknown release", ['custom-warehouse'], function () {
   var s = new Sandbox({
     warehouse: {
       v2: { recommended: true }

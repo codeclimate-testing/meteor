@@ -1,31 +1,53 @@
+import assert from "assert";
 import {WatchSet, readAndWatchFile, sha1} from '../fs/watch.js';
 import files from '../fs/files.js';
 import NpmDiscards from './npm-discards.js';
 import {Profile} from '../tool-env/profile.js';
+import {
+  optimisticReadFile,
+  optimisticReaddir,
+  optimisticLStatOrNull,
+} from "../fs/optimistic.js";
 
-// Builder has two modes of working:
-// - write files to a temp directory and later atomically move it to destination
-// - write files in-place replacing the older files
-// The later doesn't work on Windows but works well on Mac OS X and Linux, since
-// the file system allows writing new files to the path of a file opened by a
-// process. The process only retains the inode, not the path.
+// Builder is in charge of writing "bundles" to disk, which are
+// directory trees such as site archives, programs, and packages.  In
+// addition to writing data to files, it can copy or link in existing
+// files and directories (keeping track of them in a WatchSet in order
+// to trigger rebuilds appropriately).
+//
+// By default, Builder constructs the entire output directory from
+// scratch under a temporary name, and then moves it into place.
+// For efficient rebuilds, Builder can be given a `previousBuilder`,
+// in which case it will write files into the existing output directory
+// instead.
+//
+// On Windows (or when METEOR_DISABLE_BUILDER_IN_PLACE is set), Builder
+// always creates a new output directory under a temporary name rather than
+// using the old directory.  The reason is that we don't want rebuilding to
+// interfere with the running app, and we rely on the fact that on OS X and
+// Linux, if the process has opened a file for reading, it retains the file
+// by its inode, not path, so it is safe to write a new file to the same path
+// (or delete the file).
+//
+// Separate from that, Builder has a strategy of writing files under a temporary
+// name and then renaming them.  This is to achieve an "atomic" write, meaning
+// the server doesn't see a partially-written file that appears truncated.
+//
+// On Windows we copy files instead of symlinking them (see comments inline).
+
+
+// Whether to support writing files into the same directory as a previous
+// Builder on rebuild (rather than creating a new build directory and
+// moving it into place).
 const ENABLE_IN_PLACE_BUILDER_REPLACEMENT =
   (process.platform !== 'win32') &&
   ! process.env.METEOR_DISABLE_BUILDER_IN_PLACE;
 
 
-// Builder encapsulates much of the file-handling logic need to create
-// "bundles" (directory trees such as site archives, programs, or
-// packages). It can create a temporary directory in which to build
-// the bundle, moving the bundle atomically into place when and if the
-// build successfully completes; sanitize and generate unique
-// filenames; and track dependencies (files that should be watched for
-// changes when developing interactively).
-//
 // Options:
 //  - outputPath: Required. Path to the directory that will hold the
-//    bundle when building is complete. It should not exist. Its
-//    parents will be created if necessary.
+//    bundle when building is complete. It should not exist (unless
+//    previousBuilder is passed). Its parents will be created if necessary.
 // - previousBuilder: Optional. An in-memory instance of Builder left
 // from the previous iteration. It is assumed that the previous builder
 // has completed its job successfully and its files are stored on the
@@ -43,6 +65,8 @@ export default class Builder {
 
     this.writtenHashes = {};
     this.previousWrittenHashes = {};
+
+    this._realpathCache = Object.create(null);
 
     // foo/bar => foo/.build1234.bar
     // Should we include a random number? The advantage is that multiple
@@ -96,8 +120,10 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
   // root. Throws an exception on failure.
   _ensureDirectory(relPath) {
     const parts = files.pathNormalize(relPath).split(files.pathSep);
-    if (parts.length > 1 && parts[parts.length - 1] === '')
-      parts.pop(); // remove trailing slash
+    if (parts.length > 1 && parts[parts.length - 1] === '') {
+      // remove trailing slash
+      parts.pop();
+    }
 
     const partsSoFar = [];
     parts.forEach(part => {
@@ -117,7 +143,7 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
 
         if (needToMkdir) {
           // It's new -- create it
-          files.mkdir(files.pathJoin(this.buildPath, partial), 0o755);
+          files.mkdir_p(files.pathJoin(this.buildPath, partial), 0o755);
         }
         this.usedAsFile[partial] = false;
       } else if (this.usedAsFile[partial]) {
@@ -139,17 +165,19 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
       const mustBeUnique = (i === parts.length - 1);
 
       // Basic sanitization
-      if (part.match(/^\.+$/))
+      if (part.match(/^\.+$/)) {
         throw new Error(`Path contains forbidden segment '${part}'`);
+      }
 
-      part = part.replace(/[^a-zA-Z0-9._\:-]/g, '');
+      part = part.replace(/[^a-zA-Z0-9._\:\-@#]/g, '_');
 
       // If at last component, pull extension (if any) off of part
       let ext = '';
       if (shouldBeFile) {
         const split = part.split('.');
-        if (split.length > 1)
+        if (split.length > 1) {
           ext = "." + split.pop();
+        }
         part = split.join('.');
       }
 
@@ -159,13 +187,15 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
         const candidate = files.pathJoin(partsOut.join(files.pathSep), part + suffix + ext);
         if (candidate.length) {
           // If we've never heard of this, then it's unique enough.
-          if (!(candidate in this.usedAsFile))
+          if (!(candidate in this.usedAsFile)) {
             break;
+          }
           // If we want this bit to be a directory, and we don't need it to be
           // unique (ie, it isn't the very last bit), and it's currently a
           // directory, then that's OK.
-          if (!(mustBeUnique || this.usedAsFile[candidate]))
+          if (!(mustBeUnique || this.usedAsFile[candidate])) {
             break;
+          }
           // OK, either we want it to be unique and it already exists; or it is
           // currently a file (and we want it to be either a different file or a
           // directory).  Try a new suffix.
@@ -203,20 +233,24 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
   // If `file` is used then it will be added to the builder's WatchSet.
   write(relPath, {data, file, hash, sanitize, executable, symlink}) {
     // Ensure no trailing slash
-    if (relPath.slice(-1) === files.pathSep)
+    if (relPath.slice(-1) === files.pathSep) {
       relPath = relPath.slice(0, -1);
+    }
 
     // In sanitize mode, ensure path does not contain segments like
     // '..', does not contain forbidden characters, and is unique.
-    if (sanitize)
+    if (sanitize) {
       relPath = this._sanitize(relPath);
+    }
 
     let getData = null;
     if (data) {
-      if (! (data instanceof Buffer))
+      if (! (data instanceof Buffer)) {
         throw new Error("data must be a Buffer");
-      if (file)
+      }
+      if (file) {
         throw new Error("May only pass one of data and file, not both");
+      }
       getData = () => data;
     } else if (file) {
       // postpone reading the file into memory
@@ -229,7 +263,7 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
     const absPath = files.pathJoin(this.buildPath, relPath);
 
     if (symlink) {
-      files.symlink(symlink, absPath);
+      symlinkWithOverwrite(symlink, absPath);
     } else {
       hash = hash || sha1(getData());
 
@@ -254,8 +288,9 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
   // necessary. Throw an exception if the file already exists.
   writeJson(relPath, data) {
     // Ensure no trailing slash
-    if (relPath.slice(-1) === files.pathSep)
+    if (relPath.slice(-1) === files.pathSep) {
       relPath = relPath.slice(0, -1);
+    }
 
     this._ensureDirectory(files.pathDirname(relPath));
     const absPath = files.pathJoin(this.buildPath, relPath);
@@ -284,8 +319,9 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
   //   directory rather than a file.
   reserve(relPath, {directory} = {}) {
     // Ensure no trailing slash
-    if (relPath.slice(-1) === files.pathSep)
+    if (relPath.slice(-1) === files.pathSep) {
       relPath = relPath.slice(0, -1);
+    }
 
     const parts = relPath.split(files.pathSep);
     const partsSoFar = [];
@@ -293,8 +329,9 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
       const part = parts[i];
       partsSoFar.push(part);
       const soFar = partsSoFar.join(files.pathSep);
-      if (this.usedAsFile[soFar])
+      if (this.usedAsFile[soFar]) {
         throw new Error("Path reservation conflict: " + relPath);
+      }
 
       const shouldBeDirectory = (i < parts.length - 1) || directory;
       if (shouldBeDirectory) {
@@ -308,7 +345,7 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
             }
           }
           if (needToMkdir) {
-            files.mkdir(files.pathJoin(this.buildPath, soFar), 0o755);
+            files.mkdir_p(files.pathJoin(this.buildPath, soFar), 0o755);
           }
           this.usedAsFile[soFar] = false;
         }
@@ -372,11 +409,21 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
   //   entries that end with a slash if it's a directory.
   // - specificFiles: just copy these paths (specified as relative to 'to').
   // - symlink: true if the directory should be symlinked instead of copying
-  copyDirectory({from, to, ignore, specificFiles, symlink, npmDiscards}) {
-    if (to.slice(-1) === files.pathSep)
+  copyDirectory({
+    from, to,
+    ignore,
+    specificFiles,
+    symlink,
+    npmDiscards,
+    // Optional predicate to filter files and directories.
+    filter,
+  }) {
+    if (to.slice(-1) === files.pathSep) {
       to = to.slice(0, -1);
+    }
 
     const absPathTo = files.pathJoin(this.buildPath, to);
+
     if (symlink) {
       if (specificFiles) {
         throw new Error("can't copy only specific paths with a single symlink");
@@ -385,34 +432,6 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
       if (this.usedAsFile[to]) {
         throw new Error("tried to copy a directory onto " + to +
                         " but it is is already a file");
-      }
-
-      let canSymlink = true;
-      // Symlinks don't work exactly the same way on Windows, and furthermore
-      // they request Admin permissions to set.
-      if (process.platform === 'win32') {
-        canSymlink = false;
-      } else if (to in this.usedAsFile) {
-        // It's already here and is a directory, maybe because of a call to
-        // reserve with {directory: true}. If it's an empty directory, this is
-        // salvageable. The directory should exist, because all code paths which
-        // set usedAsFile to false create the directory.
-        //
-        // XXX This is somewhat broken: what if the reason we're in
-        // self.usedAsFile is because an immediate child of ours was reserved as
-        // a file but not actually written yet?
-        const children = files.readdir(absPathTo);
-        if (Object.keys(children).length === 0) {
-          files.rmdir(absPathTo);
-        } else {
-          canSymlink = false;
-        }
-      }
-
-      if (canSymlink) {
-        this._ensureDirectory(files.pathDirname(to));
-        files.symlink(files.pathResolve(from), absPathTo);
-        return;
       }
     }
 
@@ -428,18 +447,89 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
       });
     }
 
-    let walk = (absFrom, relTo) => {
+    const walk = (
+      absFrom,
+      relTo,
+      _currentRealRootDir = absFrom
+    ) => {
+      if (symlink && ! (relTo in this.usedAsFile)) {
+        this._ensureDirectory(files.pathDirname(relTo));
+        const absTo = files.pathResolve(this.buildPath, relTo);
+        symlinkWithOverwrite(absFrom, absTo);
+        return;
+      }
+
       this._ensureDirectory(relTo);
 
-      files.readdir(absFrom).forEach(item => {
-        const thisAbsFrom = files.pathResolve(absFrom, item);
+      optimisticReaddir(absFrom).forEach(item => {
+        let thisAbsFrom = files.pathResolve(absFrom, item);
         const thisRelTo = files.pathJoin(relTo, item);
 
         if (specificPaths && !(thisRelTo in specificPaths)) {
           return;
         }
 
-        const fileStatus = files.lstat(thisAbsFrom);
+        // Returns files.realpath(thisAbsFrom), iff it is external to
+        // _currentRealRootDir, using caching because this function might
+        // be called more than once.
+        let cachedExternalPath;
+        const getExternalPath = () => {
+          if (typeof cachedExternalPath !== "undefined") {
+            return cachedExternalPath;
+          }
+
+          try {
+            var real = files.realpath(
+              thisAbsFrom,
+              this._realpathCache
+            );
+          } catch (e) {
+            if (e.code !== "ENOENT" &&
+                e.code !== "ELOOP") {
+              throw e;
+            }
+            return cachedExternalPath = false;
+          }
+
+          const isExternal =
+            files.pathRelative(_currentRealRootDir, real).startsWith("..");
+
+          // Now cachedExternalPath is either a string or false.
+          return cachedExternalPath = isExternal && real;
+        };
+
+        let fileStatus = optimisticLStatOrNull(thisAbsFrom);
+
+        if (! symlink &&
+            fileStatus &&
+            fileStatus.isSymbolicLink()) {
+          // If copyDirectory is not allowed to create symbolic links to
+          // external files, and this file is a symbolic link that points
+          // to an external file, update fileStatus so that we copy this
+          // file as a normal file rather than as a symbolic link.
+
+          const externalPath = getExternalPath();
+          if (externalPath) {
+            // Copy from the real path rather than the link path.
+            thisAbsFrom = externalPath;
+
+            // Update fileStatus to match the actual file rather than the
+            // symbolic link, thus forcing the file to be copied below.
+            fileStatus = optimisticLStatOrNull(externalPath);
+
+            if (fileStatus && fileStatus.isDirectory()) {
+              // Update _currentRealRootDir so that we can judge
+              // isExternal relative to this new root directory when
+              // traversing nested directories.
+              _currentRealRootDir = externalPath;
+            }
+          }
+        }
+
+        if (! fileStatus) {
+          // If the file did not exist, skip it.
+          return;
+        }
 
         let itemForMatch = item;
         const isDirectory = fileStatus.isDirectory();
@@ -448,7 +538,14 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
         }
 
         // skip excluded files
-        if (ignore.some(pattern => itemForMatch.match(pattern))) return;
+        if (ignore.some(pattern => itemForMatch.match(pattern))) {
+          return;
+        }
+
+        if (typeof filter === "function" &&
+            ! filter(thisAbsFrom, isDirectory)) {
+          return;
+        }
 
         if (npmDiscards instanceof NpmDiscards &&
             npmDiscards.shouldDiscard(thisAbsFrom, isDirectory)) {
@@ -456,25 +553,45 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
         }
 
         if (isDirectory) {
-          walk(thisAbsFrom, thisRelTo);
+          walk(thisAbsFrom, thisRelTo, _currentRealRootDir);
+
         } else if (fileStatus.isSymbolicLink()) {
-          files.symlink(files.readlink(thisAbsFrom),
-                         files.pathResolve(this.buildPath, thisRelTo));
+          symlinkWithOverwrite(
+            // Symbolic links pointing to relative external paths are less
+            // portable than absolute links, so getExternalPath() is
+            // preferred if it returns a path.
+            getExternalPath() || files.readlink(thisAbsFrom),
+            files.pathResolve(this.buildPath, thisRelTo)
+          );
+
           // A symlink counts as a file, as far as "can you put something under
           // it" goes.
           this.usedAsFile[thisRelTo] = true;
+
         } else {
           // XXX can't really optimize this copying without reading
           // the file into memory to calculate the hash.
-          files.copyFile(thisAbsFrom,
-                         files.pathResolve(this.buildPath, thisRelTo),
-                         fileStatus.mode);
+          files.writeFile(
+            files.pathResolve(this.buildPath, thisRelTo),
+            // The reason we call files.writeFile here instead of
+            // files.copyFile is so that we can read the file using
+            // optimisticReadFile instead of files.createReadStream.
+            optimisticReadFile(thisAbsFrom),
+            // Logic borrowed from files.copyFile: "Create the file as
+            // readable and writable by everyone, and executable by everyone
+            // if the original file is executably by owner. (This mode will be
+            // modified by umask.) We don't copy the mode *directly* because
+            // this function is used by 'meteor create' which is copying from
+            // the read-only tools tree into a writable app."
+            { mode: (fileStatus.mode & 0o100) ? 0o777 : 0o666 },
+          );
+
           this.usedAsFile[thisRelTo] = true;
         }
       });
     };
 
-    walk(from, to);
+    walk(files.realpath(from, this._realpathCache), to);
   }
 
   // Returns a new Builder-compatible object that works just like a
@@ -506,11 +623,13 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
         if (method === "generateFilename") {
           // fix up the returned path to be relative to the
           // sub-bundle, not the parent bundle
-          if (ret.substr(0, 1) === '/')
+          if (ret.substr(0, 1) === '/') {
             ret = ret.substr(1);
-          if (ret.substr(0, relPathWithSep.length) !== relPathWithSep)
+          }
+          if (ret.substr(0, relPathWithSep.length) !== relPathWithSep) {
             throw new Error("generateFilename returned path outside of " +
                             "sub-bundle?");
+          }
           ret = ret.substr(relPathWithSep.length);
         }
 
@@ -585,24 +704,48 @@ Previous builder: ${previousBuilder.outputPath}, this builder: ${outputPath}`
 }
 
 function atomicallyRewriteFile(path, data, options) {
-  let stat = null;
+  // create a different file with a random name and then rename over atomically
+  const rname = '.builder-tmp-file.' + Math.floor(Math.random() * 999999);
+  const rpath = files.pathJoin(files.pathDirname(path), rname);
+  files.writeFile(rpath, data, options);
   try {
-    stat = files.stat(path);
+    files.rename(rpath, path);
   } catch (e) {
-    if (e.code !== 'ENOENT') {
+    if (e.code === 'EISDIR') {
+      // replacing a directory with a file; this is rare (so it can
+      // be a slow path) but can legitimately happen if e.g. a developer
+      // puts a file where there used to be a directory in their app.
+      files.rm_recursive(path);
+      files.rename(rpath, path);
+    } else {
       throw e;
     }
   }
+}
 
-  if (stat && stat.isDirectory()) {
-    files.rm_recursive(path);
-    files.writeFile(path, data, options);
-  } else {
-    // create a different file with a random name and then rename over atomically
-    const rname = '.builder-tmp-file.' + Math.floor(Math.random() * 999999);
-    const rpath = files.pathJoin(files.pathDirname(path), rname);
-    files.writeFile(rpath, data, options);
-    files.rename(rpath, path);
+// create a symlink, overwriting the target link, file, or directory
+// if it exists
+function symlinkWithOverwrite(source, target) {
+  const args = [source, target];
+
+  if (process.platform === "win32") {
+    if (! files.stat(source).isDirectory()) {
+      throw new Error("symlink source must be a directory: " + source);
+    }
+
+    args[2] = "junction";
+  }
+
+  try {
+    files.symlink(...args);
+  } catch (e) {
+    if (e.code === 'EEXIST') {
+      // overwrite existing link, file, or directory
+      files.rm_recursive(target);
+      files.symlink(...args);
+    } else {
+      throw e;
+    }
   }
 }
 

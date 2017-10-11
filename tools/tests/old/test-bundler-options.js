@@ -9,7 +9,7 @@ var catalog = require('../../packaging/catalog/catalog.js');
 var buildmessage = require('../../utils/buildmessage.js');
 var isopackets = require('../../tool-env/isopackets.js');
 var projectContextModule = require('../../project-context.js');
-
+var safeWatcher = require("../../fs/safe-watcher.js");
 
 var lastTmpDir = null;
 var tmpDir = function () {
@@ -74,7 +74,7 @@ var runTest = function () {
                                         "programs", "server", "node_modules")));
     // yes package node_modules directory
     assert(files.lstat(files.pathJoin(
-      tmpOutputDir, "programs", "server", "npm", "ddp-server"))
+      tmpOutputDir, "programs", "server", "npm", "node_modules", "meteor", "ddp-server"))
            .isDirectory());
 
     // verify that contents are minified
@@ -142,7 +142,7 @@ var runTest = function () {
       // package node_modules directory also a symlink
       // XXX might be breaking this
       assert(files.lstat(files.pathJoin(
-        tmpOutputDir, "programs", "server", "npm", "ddp-server", "node_modules"))
+        tmpOutputDir, "programs", "server", "npm", "node_modules", "meteor", "ddp-server", "node_modules"))
              .isSymbolicLink());
     });
   }
@@ -165,4 +165,8 @@ Fiber(function () {
     console.log('\nBundle can be found at ' + lastTmpDir);
     process.exit(1);
   }
+
+  // Allow the process to exit normally, since optimistic file watchers
+  // may be keeping the event loop busy.
+  safeWatcher.closeAllWatchers();
 }).run();

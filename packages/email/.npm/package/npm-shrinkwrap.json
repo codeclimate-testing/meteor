@@ -1,26 +1,14 @@
 {
   "dependencies": {
-    "mailcomposer": {
-      "version": "0.1.15",
-      "dependencies": {
-        "mimelib-noiconv": {
-          "version": "0.1.9"
-        }
-      }
-    },
-    "simplesmtp": {
-      "version": "0.3.10",
-      "dependencies": {
-        "rai": {
-          "version": "0.1.7"
-        },
-        "xoauth2": {
-          "version": "0.1.8"
-        }
-      }
+    "node4mailer": {
+      "version": "4.0.3",
+      "resolved": "https://registry.npmjs.org/node4mailer/-/node4mailer-4.0.3.tgz",
+      "from": "node4mailer@4.0.3"
     },
     "stream-buffers": {
-      "version": "0.2.5"
+      "version": "0.2.5",
+      "resolved": "https://registry.npmjs.org/stream-buffers/-/stream-buffers-0.2.5.tgz",
+      "from": "stream-buffers@0.2.5"
     }
   }
 }

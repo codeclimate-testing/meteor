@@ -1,7 +1,8 @@
+var assert = require('assert');
 var _ = require('underscore');
 
 var bundler = require('../isobuild/bundler.js');
-var Builder = require('../isobuild/builder.js');
+import Builder from '../isobuild/builder.js';
 var compiler = require('../isobuild/compiler.js');
 var isopackCacheModule = require('../isobuild/isopack-cache.js');
 
@@ -12,6 +13,8 @@ var watch = require('../fs/watch.js');
 var Console = require('../console/console.js').Console;
 var fiberHelpers = require('../utils/fiber-helpers.js');
 var packageMapModule = require('../packaging/package-map.js');
+var archinfo = require('../utils/archinfo.js');
+var Profile = require('./profile.js').Profile;
 
 // TL;DR: Isopacket is a set of isopacks. Isopackets are used only inside
 // meteor-tool.
@@ -39,21 +42,34 @@ var packageMapModule = require('../packaging/package-map.js');
 // process if any of their sources have changed.
 //
 // Example usage:
-//   var DDP = require('./isopackets.js').load('ddp')['ddp-client'].DDP;
+//   var DDP = require('./isopackets.js').loadIsopackage('ddp-client').DDP;
 //   var reverse = DDP.connect('reverse.meteor.com');
 //   Console.info(reverse.call('reverse', 'hello world'));
 
 
 // All of the defined isopackets. Whenever they are being built, they will be
 // built in the order listed here.
-var ISOPACKETS = {
-  'ddp': ['ddp-client'],
-  'mongo': ['npm-mongo'],
-  'ejson': ['ejson'],
-  'constraint-solver': ['constraint-solver'],
-  'cordova-support': ['boilerplate-generator', 'logging', 'webapp-hashing',
-                      'xmlbuilder'],
-  'logging': ['logging']
+export const ISOPACKETS = {
+  // These packages used to be divided up into distinct isopackets, but
+  // that resulted in extremely wasteful duplication of transitive
+  // dependencies, so now we have only one isopacket that combines all the
+  // dependencies of every former isopacket.
+  combined: [
+    // ddp
+    'ddp-client',
+    // mongo
+    'npm-mongo',
+    // ejson
+    'ejson',
+    // constraint-solver
+    'constraint-solver',
+    // cordova-support
+    'boilerplate-generator',
+    'webapp-hashing',
+    'xmlbuilder',
+    // cordova-support, logging
+    'logging',
+  ]
 };
 
 // Caches isopackets in memory (each isopacket only needs to be loaded
@@ -72,11 +88,19 @@ var ISOPACKETS = {
 // the tool itself.
 var loadedIsopackets = {};
 
-// The main entry point: loads and returns an isopacket from cache or from
-// disk. Does not do a build step: ensureIsopacketsLoadable must be called
-// first!
-var load = function (isopacketName) {
-  return fiberHelpers.noYieldsAllowed(function () {
+// The main entry point: loads the specified isopacket ("combined" by
+// default) from cache or from disk, and returns the requested package
+// dependency, complaining if the package does not exist. Note that
+// ensureIsopacketsLoadable must be called first, as this function does
+// not trigger any building.
+export function loadIsopackage(packageName, isopacketName = "combined") {
+  // Small but necessary hack: because archinfo.host() calls execFileSync,
+  // it yields the first time we call it, which is a problem for the
+  // fiberHelpers.noYieldsAllowed block below. Calling it here ensures the
+  // result is cached, so no yielding occurs later.
+  assert.strictEqual(archinfo.host().split(".", 1)[0], "os");
+
+  const isopacket = fiberHelpers.noYieldsAllowed(function () {
     if (_.has(loadedIsopackets, isopacketName)) {
       if (loadedIsopackets[isopacketName]) {
         return loadedIsopackets[isopacketName];
@@ -84,9 +108,8 @@ var load = function (isopacketName) {
 
       // This is the case where the isopacket is up to date on disk but not
       // loaded.
-      var isopacket = loadIsopacketFromDisk(isopacketName);
-      loadedIsopackets[isopacketName] = isopacket;
-      return isopacket;
+      return loadedIsopackets[isopacketName] =
+        loadIsopacketFromDisk(isopacketName);
     }
 
     if (_.has(ISOPACKETS, isopacketName)) {
@@ -96,7 +119,13 @@ var load = function (isopacketName) {
 
     throw Error("Unknown isopacket: " + isopacketName);
   });
-};
+
+  if (! _.has(isopacket, packageName)) {
+    throw new Error("Unknown isopacket dependency: " + packageName);
+  }
+
+  return isopacket[packageName];
+}
 
 var isopacketPath = function (isopacketName) {
   return files.pathJoin(config.getIsopacketRoot(), isopacketName);
@@ -105,7 +134,7 @@ var isopacketPath = function (isopacketName) {
 // ensureIsopacketsLoadable is called at startup and ensures that all isopackets
 // exist on disk as up-to-date loadable programs.
 var calledEnsure = false;
-var ensureIsopacketsLoadable = function () {
+export function ensureIsopacketsLoadable() {
   if (calledEnsure) {
     throw Error("can't ensureIsopacketsLoadable twice!");
   }
@@ -129,8 +158,9 @@ var ensureIsopacketsLoadable = function () {
   var messages = Console.withProgressDisplayVisible(function () {
     return buildmessage.capture(function () {
       _.each(ISOPACKETS, function (packages, isopacketName) {
-        if (failedPackageBuild)
+        if (failedPackageBuild) {
           return;
+        }
 
         var isopacketRoot = isopacketPath(isopacketName);
         var existingBuildinfo = files.readJSONOrNull(
@@ -162,8 +192,9 @@ var ensureIsopacketsLoadable = function () {
         }, function () {
           // Build the packages into the in-memory IsopackCache.
           isopacketBuildContext.isopackCache.buildLocalPackages(packages);
-          if (buildmessage.jobHasMessages())
+          if (buildmessage.jobHasMessages()) {
             return;
+          }
 
           // Now bundle them into a program.
           var built = bundler.buildJsImage({
@@ -172,8 +203,9 @@ var ensureIsopacketsLoadable = function () {
             isopackCache: isopacketBuildContext.isopackCache,
             use: packages
           });
-          if (buildmessage.jobHasMessages())
+          if (buildmessage.jobHasMessages()) {
             return;
+          }
 
           var builder = new Builder({outputPath: isopacketRoot});
           builder.writeJson('isopacket-buildinfo.json', {
@@ -196,26 +228,32 @@ var ensureIsopacketsLoadable = function () {
     Console.printMessages(messages);
     throw new Error("isopacket build failed?");
   }
-};
+}
 
 // Returns a new all-local-packages catalog to be used for building isopackets.
 var newIsopacketBuildingCatalog = function () {
-  if (! files.inCheckout())
+  if (! files.inCheckout()) {
     throw Error("No need to build isopackets unless in checkout!");
+  }
 
   var catalogLocal = require('../packaging/catalog/catalog-local.js');
   var isopacketCatalog = new catalogLocal.LocalCatalog;
   var messages = buildmessage.capture(
     { title: "scanning local core packages" },
     function () {
+      const packagesDir =
+        files.pathJoin(files.getCurrentToolsDir(), 'packages');
+
       // When running from a checkout, isopacket building does use local
       // packages, but *ONLY THOSE FROM THE CHECKOUT*: not app packages or
       // $PACKAGE_DIRS packages.  One side effect of this: we really really
       // expect them to all build, and we're fine with dying if they don't
       // (there's no worries about needing to springboard).
       isopacketCatalog.initialize({
-        localPackageSearchDirs: [files.pathJoin(
-          files.getCurrentToolsDir(), 'packages')],
+        localPackageSearchDirs: [
+          packagesDir,
+          files.pathJoin(packagesDir, "non-core", "*", "packages"),
+        ],
         buildingIsopackets: true
       });
     });
@@ -227,7 +265,7 @@ var newIsopacketBuildingCatalog = function () {
   return isopacketCatalog;
 };
 
-var makeIsopacketBuildContext = function () {
+export function makeIsopacketBuildContext() {
   var context = {};
   var catalog = newIsopacketBuildingCatalog();
   var versions = {};
@@ -250,7 +288,7 @@ var makeIsopacketBuildContext = function () {
     noLineNumbers: true
   });
   return context;
-};
+}
 
 // Loads a built isopacket from disk. Always loads (the cache is in 'load', not
 // this function). Does not run a build process; it must already be built.
@@ -264,6 +302,7 @@ var loadIsopacketFromDisk = function (isopacketName) {
     __meteor_bootstrap__: { startupHooks: [] },
     __meteor_runtime_config__: { meteorRelease: "ISOPACKET" }
   };
+  env.Profile = Profile;
 
   var ret;
   var messages = buildmessage.capture({
@@ -290,11 +329,3 @@ var loadIsopacketFromDisk = function (isopacketName) {
 
   return ret;
 };
-
-var isopackets = exports;
-_.extend(exports, {
-  load: load,
-  ensureIsopacketsLoadable: ensureIsopacketsLoadable,
-  ISOPACKETS: ISOPACKETS,
-  makeIsopacketBuildContext: makeIsopacketBuildContext
-});

@@ -1,10 +1,10 @@
 Package.describe({
   summary: "Reload the page while preserving application state.",
-  version: '1.1.4'
+  version: '1.1.11'
 });
 
 Package.onUse(function (api) {
-  api.use(['underscore'], 'client');
+  api.use(['underscore', 'ecmascript-runtime'], 'client');
   api.export('Reload', 'client');
   api.addFiles('reload.js', 'client');
   api.addFiles('deprecated.js', 'client');

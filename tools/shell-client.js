@@ -1,12 +1,16 @@
 var assert = require("assert");
 var fs = require("fs");
+var path = require("path");
 var net = require("net");
-var eachline = require("eachline");
 var chalk = require("chalk");
 var EOL = require("os").EOL;
-var server = require('./static-assets/server/shell-server.js');
-var EXITING_MESSAGE = server.EXITING_MESSAGE;
-var getInfoFile = server.getInfoFile;
+
+// These two values (EXITING_MESSAGE and getInfoFile) must match the
+// values used by the shell-server package.
+var EXITING_MESSAGE = "Shell exiting...";
+function getInfoFile(shellDir) {
+  return path.join(shellDir, "info.json");
+}
 
 // Invoked by the process running `meteor shell` to attempt to connect to
 // the server via the socket file.
@@ -81,9 +85,44 @@ Cp.connect = function connect() {
   });
 };
 
+Cp.setUpSocketForSingleUse = function (sock, key) {
+  sock.on("connect", function () {
+    const inputBuffers = [];
+    process.stdin.on("data", buffer => inputBuffers.push(buffer));
+    process.stdin.on("end", () => {
+      sock.write(JSON.stringify({
+        evaluateAndExit: {
+          // Make sure the entire command is written as a string within a
+          // JSON object, so that the server can easily tell when it has
+          // received the whole command.
+          command: Buffer.concat(inputBuffers).toString("utf8")
+        },
+        terminal: false,
+        key: key
+      }) + "\n");
+    });
+  });
+
+  const outputBuffers = [];
+  sock.on("data", buffer => outputBuffers.push(buffer));
+  sock.on("close", function () {
+    var output = JSON.parse(Buffer.concat(outputBuffers));
+    if (output.error) {
+      console.error(output.error);
+      process.exit(output.code);
+    } else {
+      process.stdout.write(JSON.stringify(output.result) + "\n");
+      process.exit(0);
+    }
+  });
+};
+
 Cp.setUpSocket = function setUpSocket(sock, key) {
-  var self = this;
-  self.sock = sock;
+  const self = this;
+
+  if (! process.stdin.isTTY) {
+    return self.setUpSocketForSingleUse(sock, key);
+  }
 
   // Put STDIN into "flowing mode":
   // http://nodejs.org/api/stream.html#stream_compatibility_with_older_node_versions
@@ -97,9 +136,10 @@ Cp.setUpSocket = function setUpSocket(sock, key) {
     // Sending a JSON-stringified options object (even just an empty
     // object) over the socket is required to start the REPL session.
     sock.write(JSON.stringify({
+      columns: process.stdout.columns,
       terminal: ! process.env.EMACS,
       key: key
-    }));
+    }) + "\n");
 
     process.stderr.write(shellBanner());
     process.stdin.pipe(sock);
@@ -140,7 +180,7 @@ Cp.setUpSocket = function setUpSocket(sock, key) {
 
   sock.pipe(process.stdout);
 
-  eachline(sock, "utf8", function(line) {
+  require("./utils/eachline.js").eachline(sock, function (line) {
     self.exitOnClose = line.indexOf(EXITING_MESSAGE) >= 0;
   });
 

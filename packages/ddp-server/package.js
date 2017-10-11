@@ -1,12 +1,12 @@
 Package.describe({
   summary: "Meteor's latency-compensated distributed data server",
-  version: '1.2.1',
+  version: '2.0.2',
   documentation: null
 });
 
 Npm.depends({
-  "permessage-deflate": "0.1.3",
-  sockjs: "0.3.14"
+  "permessage-deflate": "0.1.6",
+  sockjs: "0.3.18"
 });
 
 Package.onUse(function (api) {

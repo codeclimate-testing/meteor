@@ -23,6 +23,7 @@ DDPRateLimiter.getErrorMessage = function (rateLimitResult) {
  * `timeToReset` field that specifies the number of milliseconds until the next
  * method or subscription is allowed to run. The function must return a string
  * of the error message.
+ * @locus Server
  */
 DDPRateLimiter.setErrorMessage = function (message) {
   errorMessage = message;
@@ -63,9 +64,11 @@ DDPRateLimiter.setErrorMessage = function (message) {
  * Default = 10.
  * @param {number} timeInterval time interval in milliseconds after which
  * rule's counters are reset. Default = 1000.
+ * @param {function} callback function to be called after a rule is executed.
+ * @locus Server
  */
-DDPRateLimiter.addRule = function (matcher, numRequests, timeInterval) {
-  return rateLimiter.addRule(matcher, numRequests, timeInterval);
+DDPRateLimiter.addRule = function (matcher, numRequests, timeInterval, callback) {
+  return rateLimiter.addRule(matcher, numRequests, timeInterval, callback);
 };
 
 DDPRateLimiter.printRules = function () {
@@ -77,6 +80,7 @@ DDPRateLimiter.printRules = function () {
  * hit a rate limit, that limit is removed as well.
  * @param  {string} id 'ruleId' returned from `addRule`
  * @return {boolean}    True if a rule was removed.
+ * @locus Server
  */
 DDPRateLimiter.removeRule = function (id) {
   return rateLimiter.removeRule(id);

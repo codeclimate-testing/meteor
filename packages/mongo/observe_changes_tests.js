@@ -1,17 +1,18 @@
 var makeCollection = function () {
-  if (Meteor.isServer)
+  if (Meteor.isServer) {
     return new Mongo.Collection(Random.id());
-  else
+  } else {
     return new Mongo.Collection(null);
+  }
 };
 
-_.each ([{added:'added', forceOrdered: true},
-         {added:'added', forceOrdered: false},
+_.each ([{added: 'added', forceOrdered: true},
+         {added: 'added', forceOrdered: false},
          {added: 'addedBefore', forceOrdered: false}], function (options) {
-           var added = options.added;
-           var forceOrdered = options.forceOrdered;
-  Tinytest.addAsync("observeChanges - single id - basics "
-                    + added
+  var added = options.added;
+  var forceOrdered = options.forceOrdered;
+
+  Tinytest.addAsync("observeChanges - single id - basics " + added
                     + (forceOrdered ? " force ordered" : ""),
                     function (test, onComplete) {
     var c = makeCollection();
@@ -27,11 +28,12 @@ _.each ([{added:'added', forceOrdered: true},
     var fooid = c.insert({noodles: "good", bacon: "bad", apples: "ok"});
 
     var handle = c.find(fooid).observeChanges(logger);
-    if (added === 'added')
-      logger.expectResult(added, [fooid, {noodles: "good", bacon: "bad",apples: "ok"}]);
-    else
+    if (added === 'added') {
+      logger.expectResult(added, [fooid, {noodles: "good", bacon: "bad", apples: "ok"}]);
+    } else {
       logger.expectResult(added,
                           [fooid, {noodles: "good", bacon: "bad", apples: "ok"}, null]);
+    }
     c.update(fooid, {noodles: "alright", potatoes: "tasty", apples: "ok"});
     logger.expectResult("changed",
                         [fooid, {noodles: "alright", potatoes: "tasty", bacon: undefined}]);
@@ -74,7 +76,7 @@ Tinytest.addAsync("observeChanges - callback isolation", function (test, onCompl
     var fooid = c.insert({apples: "ok"});
     logger.expectResult("added", [fooid, {apples: "ok"}]);
 
-    c.update(fooid, {apples: "not ok"})
+    c.update(fooid, {apples: "not ok"});
     logger.expectResult("changed", [fooid, {apples: "not ok"}]);
 
     test.equal(c.findOne(fooid).apples, "not ok");
@@ -392,3 +394,23 @@ testAsyncMulti("observeChanges - bad query", [
     f2.wait();
   }
 ]);
+
+if (Meteor.isServer) {
+  Tinytest.addAsync(
+    "observeChanges - EnvironmentVariable",
+    function (test, onComplete) {
+      var c = makeCollection();
+      var environmentVariable = new Meteor.EnvironmentVariable;
+      environmentVariable.withValue(true, function() {
+        var handle = c.find({}, { fields: { 'type.name': 1 }}).observeChanges({
+          added: function() {
+            test.isTrue(environmentVariable.get());
+            handle.stop();
+            onComplete();
+          }
+        });
+      });
+      c.insert({ type: { name: 'foobar' } });
+    }
+  );  
+}

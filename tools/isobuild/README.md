@@ -88,7 +88,7 @@ remained the same over and over again.
 
 It is even OK to do when an app process serving these files is still running, on
 Unix, the process can retain files by their inodes (not by file paths) and then
-once the process release them, the FS will clean up unliked files.
+once the process release them, the FS will clean up unlinked files.
 
 ### Linker
 
@@ -128,7 +128,7 @@ distributes source files, so they are "fullLinked" in bunlde time together.
 ## Batch Build Plugins
 
 In Meteor 1.2, the new Build Plugin APIs have been introduced. You can read more
-about them here: [wiki](https://github.com/meteor/meteor/wiki/Build-Plugins-API).
+about them here: [wiki](https://docs.meteor.com/api/packagejs.html#build-plugin-api).
 
 The Build Plugins APIs register compilers, minifiers and linters. All of them
 are applied on different stages of the build process. Compilers are used by

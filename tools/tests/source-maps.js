@@ -4,8 +4,9 @@ var files = require('../fs/files.js');
 var catalog = require('../packaging/catalog/catalog.js');
 
 function matchPath (text, doubleBS) {
-  if (process.platform === 'win32')
+  if (process.platform === 'win32') {
     return text.replace(/\//g, doubleBS ? '\\\\' : '\\');
+  }
   return text;
  }
  function matchPathRegexp (regexp) {
@@ -17,11 +18,11 @@ selftest.define("source maps from checkout", ['checkout'], function () {
     throw new Error();
   } catch (e) {
     var index = (process.platform === 'win32') ? 2 : 1;
-    selftest.expectEqual(e.stack.split(":")[index], "17");
+    selftest.expectEqual(e.stack.split(":")[index], "18");
   }
 });
 
-selftest.define("source maps from an app", ['checkout'], function () {
+selftest.define("source maps from an app", ['checkout', 'custom-warehouse'], function () {
   var s = new Sandbox({
     warehouse: {
       v1: { recommended: true }
@@ -53,7 +54,7 @@ selftest.define("source maps from an app", ['checkout'], function () {
   run.stop();
 });
 
-selftest.define("source maps from built meteor tool", ['checkout'], function () {
+selftest.define("source maps from built meteor tool", ['checkout', 'custom-warehouse'], function () {
   var s = new Sandbox({
     warehouse: {
       v1: { recommended: true }
@@ -81,10 +82,10 @@ selftest.define("source maps from built meteor tool", ['checkout'], function () 
 
   var run = s.run("throw-error");
   run.matchErr(matchPathRegexp('\\(/tools/cli/commands\\.js:' + lineNumber));
-  run.expectExit(8);
+  run.expectExit(1);
 });
 
-selftest.define("source maps from a build plugin implementation", ['checkout'], function () {
+selftest.define("source maps from a build plugin implementation", ['checkout', 'custom-warehouse'], function () {
   var s = new Sandbox({
     warehouse: {
       v1: { recommended: true }
@@ -102,6 +103,6 @@ selftest.define("source maps from a build plugin implementation", ['checkout'], 
   // XXX This is wrong! The path on disk is
   // packages/build-plugin/build-plugin.js, but at some point we switched to the
   // servePath which is based on the *plugin*'s "package" name.
-  run.match(matchPathRegexp('packages/build-plugin-itself/build-plugin\\.js:2:1\\b'));
+  run.match(matchPathRegexp('packages/build-plugin-itself/build-plugin\\.js:2:'));
   run.stop();
 });

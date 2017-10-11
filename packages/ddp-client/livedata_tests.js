@@ -1,3 +1,5 @@
+import { DDP, LivedataTest } from "./namespace.js";
+
 // XXX should check error codes
 var failure = function (test, code, reason) {
   return function (error, result) {
@@ -111,7 +113,7 @@ testAsyncMulti("livedata - basic method invocation", [
 
     // On either, with a callback, calls the callback and does not throw
     var ret = Meteor.call("unknown method",
-                          expect(failure(test, 404, "Method not found")));
+                          expect(failure(test, 404, "Method 'unknown method' not found")));
     test.equal(ret, undefined);
   },
 

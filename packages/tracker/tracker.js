@@ -26,13 +26,6 @@ Tracker.active = false;
  */
 Tracker.currentComputation = null;
 
-// References to all computations created within the Tracker by id.
-// Keeping these references on an underscore property gives more control to
-// tooling and packages extending Tracker without increasing the API surface.
-// These can used to monkey-patch computations, their functions, use
-// computation ids for tracking, etc.
-Tracker._computations = {};
-
 var setCurrentComputation = function (c) {
   Tracker.currentComputation = c;
   Tracker.active = !! c;
@@ -203,9 +196,6 @@ Tracker.Computation = function (f, parent, onError) {
   self._onError = onError;
   self._recomputing = false;
 
-  // Register the computation within the global Tracker.
-  Tracker._computations[self._id] = self;
-
   var errored = true;
   try {
     self._compute();
@@ -300,8 +290,6 @@ Tracker.Computation.prototype.stop = function () {
   if (! self.stopped) {
     self.stopped = true;
     self.invalidate();
-    // Unregister from global Tracker.
-    delete Tracker._computations[self._id];
     for(var i = 0, f; f = self._onStopCallbacks[i]; i++) {
       Tracker.nonreactive(function () {
         withNoYieldsAllowed(f)(self);
@@ -351,6 +339,32 @@ Tracker.Computation.prototype._recompute = function () {
   } finally {
     self._recomputing = false;
   }
+};
+
+/**
+ * @summary Process the reactive updates for this computation immediately
+ * and ensure that the computation is rerun. The computation is rerun only
+ * if it is invalidated.
+ * @locus Client
+ */
+Tracker.Computation.prototype.flush = function () {
+  var self = this;
+
+  if (self._recomputing)
+    return;
+
+  self._recompute();
+};
+
+/**
+ * @summary Causes the function inside this computation to run and
+ * synchronously process all reactive updtes.
+ * @locus Client
+ */
+Tracker.Computation.prototype.run = function () {
+  var self = this;
+  self.invalidate();
+  self.flush();
 };
 
 //
@@ -442,6 +456,15 @@ Tracker.flush = function (options) {
                       throwFirstError: options && options._throwFirstError });
 };
 
+/**
+ * @summary True if we are computing a computation now, either first time or recompute.  This matches Tracker.active unless we are inside Tracker.nonreactive, which nullfies currentComputation even though an enclosing computation may still be running.
+ * @locus Client
+ * @returns {Boolean}
+ */
+Tracker.inFlush = function () {
+  return inFlush;
+}
+
 // Run all pending computations and afterFlush callbacks.  If we were not called
 // directly via Tracker.flush, this may return before they're all done to allow
 // the event loop to run a little before continuing.
@@ -457,7 +480,7 @@ Tracker._runFlush = function (options) {
   // any useful notion of a nested flush.
   //
   // https://app.asana.com/0/159908330244/385138233856
-  if (inFlush)
+  if (Tracker.inFlush())
     throw new Error("Can't call Tracker.flush while flushing");
 
   if (inCompute)
@@ -548,7 +571,7 @@ Tracker._runFlush = function (options) {
  * one argument: the Computation object that will be returned.
  * @param {Object} [options]
  * @param {Function} options.onError Optional. The function to run when an error
- * happens in the Computation. The only argument it recieves is the Error
+ * happens in the Computation. The only argument it receives is the Error
  * thrown. Defaults to the error being logged to the console.
  * @returns {Tracker.Computation}
  */

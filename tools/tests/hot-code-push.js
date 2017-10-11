@@ -7,6 +7,8 @@ selftest.define("css hot code push", function (options) {
     clients: options.clients
   });
 
+  s.set("METEOR_WATCH_PRIORITIZE_CHANGED", "false");
+
   s.createApp("myapp", "css-injection-test");
   s.cd("myapp");
   s.testWithAllClients(function (run) {
@@ -116,7 +118,7 @@ selftest.define("versioning hot code push", function (options) {
   });
 });
 
-selftest.define("javascript hot code push", function (options) {
+selftest.define("javascript hot code push", ["slow"], function (options) {
   var s = new Sandbox({
     clients: options.clients
   });
@@ -209,7 +211,7 @@ my-package`);
     run.match("packageVar: foo");
 
     s.write("packages/my-package/foo.js", "packageVar = 'bar'");
-    run.match("client connected: 1");
+    run.match("client connected: 0");
     run.match("jsVar: undefined");
     run.match("packageVar: bar");
 
@@ -222,12 +224,8 @@ appcache`);
     run.match("client connected: 0");
     run.match("jsVar: undefined");
 
-    // XXX: Remove me.  This shouldn't be needed, but sometimes
-    // if we run too quickly on fast (or Linux?) machines, it looks
-    // like there's a race and we see a weird state
-    utils.sleepMs(10000);
-
     s.write("client/test.js", "jsVar = 'bar'");
+    run.waitSecs(20);
     run.match("client connected: 1");
     run.match("jsVar: bar");
 

@@ -1,6 +1,6 @@
 Package.describe({
   summary: "Logging facility.",
-  version: '1.0.8'
+  version: '1.1.18'
 });
 
 Npm.depends({
@@ -12,12 +12,12 @@ Npm.strip({
 });
 
 Cordova.depends({
-  'cordova-plugin-console': '1.0.1'
+  'cordova-plugin-console': '1.0.7'
 });
 
 Package.onUse(function (api) {
   api.export('Log');
-  api.use(['underscore', 'ejson']);
+  api.use(['underscore', 'ejson', 'modules']);
   api.addFiles('logging.js');
   api.addFiles('logging_cordova.js', 'web.cordova');
 });

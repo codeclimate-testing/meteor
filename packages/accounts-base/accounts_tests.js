@@ -13,6 +13,50 @@ Tinytest.add('accounts - config validates keys', function (test) {
   });
 });
 
+Tinytest.add('accounts - config - token lifetime', function (test) {
+  const loginExpirationInDays = Accounts._options.loginExpirationInDays;
+  Accounts._options.loginExpirationInDays = 2;
+  test.equal(Accounts._getTokenLifetimeMs(), 2 * 24 * 60 * 60 * 1000);
+  Accounts._options.loginExpirationInDays = loginExpirationInDays;
+});
+
+Tinytest.add('accounts - config - unexpiring tokens', function (test) {
+  const loginExpirationInDays = Accounts._options.loginExpirationInDays;
+
+  // When setting loginExpirationInDays to null in the global Accounts
+  // config object, make sure the returned token lifetime represents an
+  // unexpiring token date (is very far into the future).
+  Accounts._options.loginExpirationInDays = null;
+  test.equal(
+    Accounts._getTokenLifetimeMs(),
+    Accounts.LOGIN_UNEXPIRING_TOKEN_DAYS * 24 * 60 * 60 * 1000,
+  );
+
+  // Verify token expiration date retrieval returns a Date.
+  // (verifies https://github.com/meteor/meteor/issues/9066)
+  test.isTrue(
+    !isNaN(Accounts._tokenExpiration(new Date())),
+    'Returned token expiration should be a Date',
+  );
+
+  // Verify the token expiration check works properly.
+  // (verifies https://github.com/meteor/meteor/issues/9066)
+  const futureDate = new Date();
+  futureDate.setDate(futureDate.getDate() + 200);
+  test.isFalse(Accounts._tokenExpiresSoon(futureDate));
+
+  Accounts._options.loginExpirationInDays = loginExpirationInDays;
+});
+
+Tinytest.add('accounts - config - default token lifetime', function (test) {
+  const options = Accounts._options;
+  Accounts._options = {};
+  test.equal(
+    Accounts._getTokenLifetimeMs(),
+    Accounts.DEFAULT_LOGIN_EXPIRATION_DAYS * 24 * 60 * 60 * 1000,
+  );
+  Accounts._options = options;
+});
 
 var idsInValidateNewUser = {};
 Accounts.validateNewUser(function (user) {
@@ -388,6 +432,10 @@ Tinytest.add(
     var onLoginStopper = Accounts.onLogin(function(attempt) {
       test.equal(Meteor.userId(), onLoginExpectedUserId, "onLogin");
     });
+    var onLogoutStopper = Accounts.onLogout(function(logoutContext) {
+      test.equal(logoutContext.user._id, onLogoutExpectedUserId, "onLogout");
+      test.instanceOf(logoutContext.connection, Object);
+    });
     var onLoginFailureStopper = Accounts.onLoginFailure(function(attempt) {
       test.equal(Meteor.userId(), onLoginFailureExpectedUserId, "onLoginFailure");
     });
@@ -408,9 +456,14 @@ Tinytest.add(
     var onLoginFailureExpectedUserId = userId;
     test.throws(function() { conn.call('login', { resume: "bogus" }) }, '403');
 
+    // Trigger onLogout callbacks
+    var onLogoutExpectedUserId = userId;
+    conn.call('logout');
+
     conn.disconnect();
     validateStopper.stop();
     onLoginStopper.stop();
+    onLogoutStopper.stop();
     onLoginFailureStopper.stop();
   }
 );

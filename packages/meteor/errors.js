@@ -4,26 +4,19 @@
 //
 Meteor.makeErrorType = function (name, constructor) {
   var errorClass = function (/*arguments*/) {
-    var self = this;
-
     // Ensure we get a proper stack trace in most Javascript environments
     if (Error.captureStackTrace) {
       // V8 environments (Chrome and Node.js)
-      Error.captureStackTrace(self, errorClass);
+      Error.captureStackTrace(this, errorClass);
     } else {
-      // Firefox
-      var e = new Error;
-      e.__proto__ = errorClass.prototype;
-      if (e instanceof errorClass)
-        self = e;
+      // Borrow the .stack property of a native Error object.
+      this.stack = new Error().stack;
     }
     // Safari magically works.
 
-    constructor.apply(self, arguments);
+    constructor.apply(this, arguments);
 
-    self.errorType = name;
-
-    return self;
+    this.errorType = name;
   };
 
   Meteor._inherits(errorClass, Error);
@@ -54,7 +47,7 @@ Meteor.makeErrorType = function (name, constructor) {
  * ```
  * // on the server, pick a code unique to this error
  * // the reason field should be a useful debug message
- * throw new Meteor.Error("logged-out", 
+ * throw new Meteor.Error("logged-out",
  *   "The user must be logged in to post a comment.");
  *
  * // on the client
@@ -66,10 +59,10 @@ Meteor.makeErrorType = function (name, constructor) {
  *   }
  * });
  * ```
- * 
+ *
  * For legacy reasons, some built-in Meteor functions such as `check` throw
  * errors with a number in this field.
- * 
+ *
  * @param {String} [reason] Optional.  A short human-readable summary of the
  * error, like 'Not Found'.
  * @param {String} [details] Optional.  Additional information about the error,
@@ -79,6 +72,10 @@ Meteor.Error = Meteor.makeErrorType(
   "Meteor.Error",
   function (error, reason, details) {
     var self = this;
+
+    // Newer versions of DDP use this property to signify that an error
+    // can be sent back and reconstructed on the calling client.
+    self.isClientSafe = true;
 
     // String code uniquely identifying this kind of error.
     self.error = error;

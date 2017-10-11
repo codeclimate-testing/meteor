@@ -90,15 +90,16 @@ testAsyncMulti("httpcall - errors", [
       test.isFalse(error.response);
     };
 
-    // 0.0.0.0 is an illegal IP address, and thus should always give an error.
+    const invalidIp = "0.0.0.199";
+    // This is an invalid destination IP address, and thus should always give an error.
     // If your ISP is intercepting DNS misses and serving ads, an obviously
     // invalid URL (http://asdf.asdf) might produce an HTTP response.
-    HTTP.call("GET", "http://0.0.0.0/", expect(unknownServerCallback));
+    HTTP.call("GET", `http://${invalidIp}/`, expect(unknownServerCallback));
 
     if (Meteor.isServer) {
       // test sync version
       try {
-        var unknownServerResult = HTTP.call("GET", "http://0.0.0.0/");
+        var unknownServerResult = HTTP.call("GET", `http://${invalidIp}/`);
         unknownServerCallback(undefined, unknownServerResult);
       } catch (e) {
         unknownServerCallback(e, e.response);
@@ -276,6 +277,7 @@ testAsyncMulti("httpcall - methods", [
     test_method("POST");
     test_method("PUT");
     test_method("DELETE", 'del');
+    test_method("PATCH");
   },
 
   function(test, expect) {
@@ -417,8 +419,8 @@ testAsyncMulti("httpcall - params", [
     do_test("GET", "/", {foo:"bar", fruit:"apple"}, "/?foo=bar&fruit=apple", "");
     do_test("POST", "/", {foo:"bar", fruit:"apple"}, "/", "foo=bar&fruit=apple");
     do_test("POST", "/", {foo:"bar", fruit:"apple"}, "/", "foo=bar&fruit=apple");
-    do_test("GET", "/", {'foo!':"bang!"}, {}, "/?foo%21=bang%21", "");
-    do_test("POST", "/", {'foo!':"bang!"}, {}, "/", "foo%21=bang%21");
+    do_test("GET", "/", {'foo?':"bang?"}, {}, "/?foo%3F=bang%3F", "");
+    do_test("POST", "/", {'foo?':"bang?"}, {}, "/", "foo%3F=bang%3F");
     do_test("POST", "/", {foo:"bar", fruit:"apple"}, {
       content: "stuff!"}, "/?foo=bar&fruit=apple", "stuff!");
     do_test("POST", "/", {foo:"bar", greeting:"Hello World"}, {

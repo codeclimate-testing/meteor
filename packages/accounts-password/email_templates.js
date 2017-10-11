@@ -1,8 +1,3 @@
-/**
- * @summary Options to customize emails sent from the Accounts system.
- * @locus Server
- */
-
 function greet(welcomeMsg) {
   return function(user, url) {
       var greeting = (user.profile && user.profile.name) ?
@@ -18,26 +13,20 @@ Thanks.
   };
 }
 
+/**
+ * @summary Options to customize emails sent from the Accounts system.
+ * @locus Server
+ * @importFromPackage accounts-base
+ */
 Accounts.emailTemplates = {
-  from: "Meteor Accounts <no-reply@meteor.com>",
+  from: "Accounts Example <no-reply@example.com>",
   siteName: Meteor.absoluteUrl().replace(/^https?:\/\//, '').replace(/\/$/, ''),
 
   resetPassword: {
     subject: function(user) {
       return "How to reset your password on " + Accounts.emailTemplates.siteName;
     },
-    text: function(user, url) {
-      var greeting = (user.profile && user.profile.name) ?
-            ("Hello " + user.profile.name + ",") : "Hello,";
-      return `${greeting}
-
-To reset your password, simply click the link below.
-
-${url}
-
-Thanks.
-`;
-    }
+    text: greet("To reset your password")
   },
   verifyEmail: {
     subject: function(user) {

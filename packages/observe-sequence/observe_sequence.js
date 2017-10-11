@@ -9,6 +9,15 @@ var warn = function () {
   }
 };
 
+// isArray returns true for arrays of these types:
+// standard arrays: instanceof Array === true, _.isArray(arr) === true
+// vm generated arrays: instanceOf Array === false, _.isArray(arr) === true
+// subclassed arrays: instanceof Array === true, _.isArray(arr) === false
+// see specific tests
+function isArray(arr) {
+  return arr instanceof Array || _.isArray(arr);
+}
+
 var idStringify = MongoID.idStringify;
 var idParse = MongoID.idParse;
 
@@ -94,7 +103,7 @@ ObserveSequence = {
 
         if (!seq) {
           seqArray = seqChangedToEmpty(lastSeqArray, callbacks);
-        } else if (seq instanceof Array) {
+        } else if (isArray(seq)) {
           seqArray = seqChangedToArray(lastSeqArray, seq, callbacks);
         } else if (isStoreCursor(seq)) {
           var result /* [seqArray, activeObserveHandle] */ =
@@ -126,7 +135,7 @@ ObserveSequence = {
   fetch: function (seq) {
     if (!seq) {
       return [];
-    } else if (seq instanceof Array) {
+    } else if (isArray(seq)) {
       return seq;
     } else if (isStoreCursor(seq)) {
       return seq.fetch();
@@ -289,10 +298,11 @@ seqChangedToArray = function (lastSeqArray, array, callbacks) {
       id = "-" + item;
     } else if (typeof item === 'number' ||
                typeof item === 'boolean' ||
-               item === undefined) {
+               item === undefined ||
+               item === null) {
       id = item;
     } else if (typeof item === 'object') {
-      id = (item && _.has(item, '_id')) ? item._id : index;
+      id = (item && ('_id' in item)) ? item._id : index;
     } else {
       throw new Error("{{#each}} doesn't support arrays with " +
                       "elements of type " + typeof item);
@@ -300,7 +310,7 @@ seqChangedToArray = function (lastSeqArray, array, callbacks) {
 
     var idString = idStringify(id);
     if (idsUsed[idString]) {
-      if (typeof item === 'object' && '_id' in item)
+      if (item && typeof item === 'object' && '_id' in item)
         warn("duplicate id " + id + " in", array);
       id = Random.id();
     } else {

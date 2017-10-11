@@ -6,14 +6,34 @@ var utils = require('../utils/utils.js');
 var watch = require('../fs/watch.js');
 var buildmessage = require('../utils/buildmessage.js');
 var meteorNpm = require('./meteor-npm.js');
-var NpmDiscards = require('./npm-discards.js');
-var Builder = require('./builder.js');
+import Builder from './builder.js';
 var archinfo = require('../utils/archinfo.js');
 var catalog = require('../packaging/catalog/catalog.js');
 var packageVersionParser = require('../packaging/package-version-parser.js');
 var compiler = require('./compiler.js');
-var packageAPIModule = require('./package-api.js');
 var Profile = require('../tool-env/profile.js').Profile;
+
+import SourceArch from './source-arch.js';
+import { PackageNamespace } from "./package-namespace.js";
+import { PackageNpm } from "./package-npm.js";
+import { PackageCordova } from "./package-cordova.js";
+import { PackageAPI } from "./package-api.js";
+
+import {
+  TEST_FILENAME_REGEXPS,
+  APP_TEST_FILENAME_REGEXPS,
+  isTestFilePath } from './test-files.js';
+
+import {
+  convert as convertColonsInPath
+} from '../utils/colon-converter.js';
+
+import {
+  optimisticReadFile,
+  optimisticHashOrNull,
+  optimisticStatOrNull,
+  optimisticReadMeteorIgnore,
+} from "../fs/optimistic.js";
 
 // XXX: This is a medium-term hack, to avoid having the user set a package name
 // & test-name in package.describe. We will change this in the new control file
@@ -48,6 +68,7 @@ var loadOrderSort = function (sourceProcessorSet, arch) {
 
     case 'wrong-arch':
     case 'unmatched':
+    case 'meteor-ignore':
       return false;
 
     default:
@@ -92,15 +113,23 @@ var loadOrderSort = function (sourceProcessorSet, arch) {
     // deeper paths loaded first.
     var len_a = a_parts.length;
     var len_b = b_parts.length;
-    if (len_a < len_b) return 1;
-    if (len_b < len_a) return -1;
+    if (len_a < len_b) {
+      return 1;
+    }
+    if (len_b < len_a) {
+      return -1;
+    }
 
     // Otherwise compare path components lexicographically.
     for (var i = 0; i < len_a; ++i) {
       var a_part = a_parts[i];
       var b_part = b_parts[i];
-      if (a_part < b_part) return -1;
-      if (b_part < a_part) return 1;
+      if (a_part < b_part) {
+        return -1;
+      }
+      if (b_part < a_part) {
+        return 1;
+      }
     }
 
     // Never reached unless there are somehow duplicate paths.
@@ -125,7 +154,9 @@ var splitConstraint = function (c) {
 // for some reason). Skips lines that start with an exclamation point.
 var getExcerptFromReadme = function (text) {
   // Don't waste time parsing if the document is empty.
-  if (! text) return "";
+  if (! text) {
+    return "";
+  }
 
   // Split into lines with Commonmark.
   var commonmark = require('commonmark');
@@ -155,7 +186,9 @@ var getExcerptFromReadme = function (text) {
   });
 
   // If we have not found anything, we are done.
-  if (_.isEmpty(relevantNodes)) return "";
+  if (_.isEmpty(relevantNodes)) {
+    return "";
+  }
 
   // For now, we will do the simple thing of just taking the raw markdown from
   // the start of the excerpt to the end.
@@ -175,95 +208,38 @@ var getExcerptFromReadme = function (text) {
   return excerpt.replace(/^\n+|\n+$/g, "");
 };
 
-///////////////////////////////////////////////////////////////////////////////
-// SourceArch
-///////////////////////////////////////////////////////////////////////////////
+class SymlinkLoopChecker {
+  constructor(sourceRoot) {
+    this.sourceRoot = sourceRoot;
+    this._seenPaths = {};
+    this._realpathCache = {};
+  }
 
-// Options:
-// - kind [required]
-// - arch [required]
-// - uses
-// - implies
-// - getFiles
-// - declaredExports
-// - watchSet
-//
-// Do not include the source files in watchSet. They will be
-// added at compile time when the sources are actually read.
-var SourceArch = function (pkg, options) {
-  var self = this;
-  options = options || {};
-  self.pkg = pkg;
+  check(relDir, quietly = true) {
+    const absPath = files.pathJoin(this.sourceRoot, relDir);
 
-  // Kind of this sourceArchitecture. At the moment, there are really three
-  // options -- package, plugin, and app. We use these in linking.
-  self.kind = options.kind;
+    try {
+      var realPath = files.realpath(absPath, this._realpathCache);
+    } catch (e) {
+      if (!e || e.code !== 'ELOOP') {
+        throw e;
+      }
+      // else leave realPath undefined
+    }
 
-  // The architecture (fully or partially qualified) that can use this
-  // unibuild.
-  self.arch = options.arch;
+    if (! realPath || _.has(this._seenPaths, realPath)) {
+      if (! quietly) {
+        buildmessage.error("Symlink cycle detected at " + relDir);
+      }
 
-  // Packages used. The ordering is significant only for determining
-  // import symbol priority (it doesn't affect load order), and a
-  // given package could appear more than once in the list, so code
-  // that consumes this value will need to guard appropriately. Each
-  // element in the array has keys:
-  // - package: the package name
-  // - constraint: the constraint on the version of the package to use,
-  //   as a string (may be null)
-  // - unordered: If true, we don't want the package's imports and we
-  //   don't want to force the package to load before us. We just want
-  //   to ensure that it loads if we load.
-  // - weak: If true, we don't *need* to load the other package, but
-  //   if the other package ends up loaded in the target, it must
-  //   be forced to load before us. We will not get its imports
-  //   or plugins.
-  // It is an error for both unordered and weak to be true, because
-  // such a dependency would have no effect.
-  //
-  // In most places, instead of using 'uses' directly, you want to use
-  // something like compiler.eachUsedUnibuild so you also take into
-  // account implied packages.
-  //
-  // Note that if `package` starts with 'isobuild:', it actually represents a
-  // dependency on a feature of the Isobuild build tool, not a real package. You
-  // need to be aware of this when processing a `uses` array, which is another
-  // reason to use eachUsedUnibuild instead.
-  self.uses = options.uses || [];
+      return true;
+    }
 
-  // Packages which are "implied" by using this package. If a unibuild X
-  // uses this unibuild Y, and Y implies Z, then X will effectively use Z
-  // as well (and get its imports and plugins).  An array of objects
-  // of the same type as the elements of self.uses (although for now
-  // unordered and weak are not allowed).
-  self.implies = options.implies || [];
+    this._seenPaths[realPath] = true;
 
-  // A function that returns the source files for this architecture. Object with
-  // keys `sources` and `assets`, where each is an array of objects with keys
-  // "relPath" and "fileOptions". Null if loaded from isopack.
-  //
-  // fileOptions is optional and represents arbitrary options passed
-  // to "api.addFiles"; they are made available on to the plugin as
-  // compileStep.fileOptions.
-  //
-  // This is a function rather than a literal array because for an
-  // app, we need to know the file extensions registered by the
-  // plugins in order to compute the sources list, so we have to wait
-  // until build time (after we have loaded any plugins, including
-  // local plugins in this package) to compute this.
-  self.getFiles = options.getFiles || null;
-
-  // Symbols that this architecture should export. List of symbols (as
-  // strings).
-  self.declaredExports = options.declaredExports || null;
-
-  // Files and directories that we want to monitor for changes in
-  // development mode, as a watch.WatchSet. In the latest refactoring
-  // of the code, this does not include source files or directories,
-  // but only control files such as package.js and .meteor/packages,
-  // since the rest are not determined until compile time.
-  self.watchSet = options.watchSet || new watch.WatchSet;
-};
+    return false;
+  }
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 // PackageSource
@@ -322,7 +298,7 @@ var PackageSource = function () {
 
   // Files to be stripped from the installed NPM dependency tree. See the
   // Npm.strip comment below for further usage information.
-  self.npmDiscards = new NpmDiscards;
+  self.npmDiscards = null;
 
   // Absolute path to a directory on disk that serves as a cache for
   // the npm dependencies, so we don't have to fetch them on every
@@ -352,6 +328,10 @@ var PackageSource = function () {
   // A package marked prodOnly is ONLY picked up by the bundler for production
   // builds.
   self.prodOnly = false;
+
+  // A package marked testOnly is ONLY picked up by the bundler as
+  // part of the `meteor test` command.
+  self.testOnly = false;
 
   // If this is set, we will take the currently running git checkout and bundle
   // the meteor tool from it inside this package as a tool. We will include
@@ -401,14 +381,16 @@ _.extend(PackageSource.prototype, {
   // - npmDependencies
   // - cordovaDependencies
   // - npmDir
+  // - localNodeModulesDirs
   initFromOptions: function (name, options) {
     var self = this;
     self.name = name;
 
     if (options.sources && ! _.isEmpty(options.sources) &&
-        (! options.sourceRoot || ! options.serveRoot))
+        (! options.sourceRoot || ! options.serveRoot)) {
       throw new Error("When source files are given, sourceRoot and " +
                       "serveRoot must be specified");
+    }
 
     // sourceRoot is a relative file system path, one slash identifies a root
     // relative to some starting location
@@ -416,11 +398,15 @@ _.extend(PackageSource.prototype, {
     // serveRoot is actually a part of a url path, root here is a forward slash
     self.serveRoot = options.serveRoot || '/';
 
-    utils.ensureOnlyExactVersions(options.npmDependencies);
+    utils.ensureOnlyValidVersions(options.npmDependencies, {forCordova: false});
     self.npmDependencies = options.npmDependencies;
-    self.npmCacheDirectory = options.npmDir;
 
-    utils.ensureOnlyExactVersions(options.cordovaDependencies);
+    // If options.npmDir is a string, make sure it contains no colons.
+    self.npmCacheDirectory = _.isString(options.npmDir)
+      ? convertColonsInPath(options.npmDir)
+      : options.npmDir;
+
+    utils.ensureOnlyValidVersions(options.cordovaDependencies, {forCordova: true});
     self.cordovaDependencies = options.cordovaDependencies;
 
     const sources = options.sources.map((source) => {
@@ -436,6 +422,7 @@ _.extend(PackageSource.prototype, {
     const sourceArch = new SourceArch(self, {
       kind: options.kind,
       arch: "os",
+      sourceRoot: self.sourceRoot,
       uses: _.map(options.use, splitConstraint),
       getFiles() {
         return {
@@ -444,10 +431,16 @@ _.extend(PackageSource.prototype, {
       }
     });
 
+    if (options.localNodeModulesDirs) {
+      _.extend(sourceArch.localNodeModulesDirs,
+               options.localNodeModulesDirs);
+    }
+
     self.architectures.push(sourceArch);
 
-    if (! self._checkCrossUnibuildVersionConstraints())
+    if (! self._checkCrossUnibuildVersionConstraints()) {
       throw new Error("only one unibuild, so how can consistency check fail?");
+    }
   },
 
   // Initialize a PackageSource from a package.js-style package directory. Uses
@@ -461,7 +454,7 @@ _.extend(PackageSource.prototype, {
   // - name: override the name of this package with a different name.
   // - buildingIsopackets: true if this is being scanned in the process
   //   of building isopackets
-  initFromPackageDir: function (dir, options) {
+  initFromPackageDir: Profile("PackageSource#initFromPackageDir", function (dir, options) {
     var self = this;
     buildmessage.assertInCapture();
     var isPortable = true;
@@ -497,26 +490,35 @@ _.extend(PackageSource.prototype, {
         self.isCore = true;
       }
     }
-    if (! files.exists(self.sourceRoot))
+    if (! files.exists(self.sourceRoot)) {
       throw new Error("putative package directory " + dir + " doesn't exist?");
+    }
 
-    var fileAndDepLoader = null;
-    var npmDependencies = null;
-    var cordovaDependencies = null;
+    const packageFileHashes = Object.create(null);
+    const packageJsPath = files.pathJoin(self.sourceRoot, 'package.js');
+    const packageJsCode = optimisticReadFile(packageJsPath);
+    packageFileHashes[packageJsPath] =
+      optimisticHashOrNull(packageJsPath);
 
-    var packageJsPath = files.pathJoin(self.sourceRoot, 'package.js');
-    var code = files.readFile(packageJsPath);
-    var packageJsHash = watch.sha1(code);
+    const pkgJsonPath = files.pathJoin(self.sourceRoot, 'package.json');
+    const pkgJsonStat = optimisticStatOrNull(pkgJsonPath);
+    if (pkgJsonStat &&
+        pkgJsonStat.isFile()) {
+      packageFileHashes[pkgJsonPath] =
+        optimisticHashOrNull(pkgJsonPath);
+    }
 
-    var hasTests = false;
+    function watchPackageFiles(watchSet) {
+      _.each(packageFileHashes, (hash, path) => {
+        watchSet.addFile(path, hash);
+      });
+    }
 
     // Any package that depends on us needs to be rebuilt if our package.js file
     // changes, because a change to package.js might add or remove a plugin,
     // which could change a file from being handled by plugin vs treated as
     // an asset.
-    self.pluginWatchSet.addFile(packageJsPath, packageJsHash);
-
-    // == 'Package' object visible in package.js ==
+    watchPackageFiles(self.pluginWatchSet);
 
     /**
      * @global
@@ -525,456 +527,26 @@ _.extend(PackageSource.prototype, {
      * @namespace
      * @locus package.js
      */
-    var Package = {
-      // Set package metadata. Options:
-      // - summary: for 'meteor list' & package server
-      // - version: package version string
-      // There used to be a third option documented here,
-      // 'environments', but it was never implemented and no package
-      // ever used it.
-
-      /**
-       * @summary Provide basic package information.
-       * @locus package.js
-       * @memberOf Package
-       * @param {Object} options
-       * @param {String} options.summary A concise 1-2 sentence description of
-       * the package, required for publication.
-       * @param {String} options.version The (extended)
-       * [semver](http://www.semver.org) version for your package. Additionally,
-       * Meteor allows a wrap number: a positive integer that follows the
-       * version number. If you are porting another package that uses semver
-       * versioning, you may want to use the original version, postfixed with
-       * `_wrapnumber`. For example, `1.2.3_1` or `2.4.5-rc1_4`. Wrap numbers
-       * sort after the original numbers: `1.2.3` < `1.2.3_1` < `1.2.3_2` <
-       * `1.2.4-rc.0`. If no version is specified, this field defaults to
-       * `0.0.0`. If you want to publish your package to the package server, you
-       * must specify a version.
-       * @param {String} options.name Optional name override. By default, the
-       * package name comes from the name of its directory.
-       * @param {String} options.git Optional Git URL to the source repository.
-       * @param {String} options.documentation Optional Filepath to
-       * documentation. Set to 'README.md' by default. Set this to null to submit
-       * no documentation.
-       * @param {Boolean} options.debugOnly A package with this flag set to true
-       * will not be bundled into production builds. This is useful for packages
-       * meant to be used in development only.
-       * @param {Boolean} options.prodOnly A package with this flag set to true
-       * will ONLY be bundled into production builds.
-       */
-      describe: function (options) {
-        _.each(options, function (value, key) {
-          if (key === "summary" ||
-              key === "git") {
-            self.metadata[key] = value;
-          } else if (key === "documentation") {
-            self.metadata[key] = value;
-            self.docsExplicitlyProvided = true;
-          } else if (key === "version") {
-            if (typeof(value) !== "string") {
-              buildmessage.error("The package version (specified with "
-                                 + "Package.describe) must be a string.");
-              // Recover by pretending that version was not set.
-            } else {
-              var goodVersion = true;
-              try {
-                var parsedVersion = packageVersionParser.getValidServerVersion(
-                  value);
-              } catch (e) {
-                if (!e.versionParserError)
-                  throw e;
-                buildmessage.error(
-                  "The package version " + value + " (specified with Package.describe) "
-                    + "is not a valid Meteor package version.\n"
-                    + "Valid package versions are semver (see http://semver.org/), "
-                    + "optionally followed by '_' and an integer greater or equal to 1.");
-                goodVersion = false;
-              }
-              // Recover by pretending that the version was not set.
-            }
-            if (goodVersion && parsedVersion !== value) {
-              buildmessage.error(
-                "The package version (specified with Package.describe) may not "
-                  + "contain a plus-separated build ID.");
-              // Recover by pretending that the version was not set.
-              goodVersion = false;
-            }
-            if (goodVersion) {
-              self.version = value;
-              self.versionExplicitlyProvided = true;
-            }
-          } else if (key === "name" && !self.isTest) {
-            if (!self.name) {
-              self.name = value;
-            } else if (self.name !== value) {
-              // Woah, so we requested a non-test package by name, and it is not
-              // the name that we find inside. That's super weird.
-              buildmessage.error(
-                "trying to initialize a nonexistent base package " + value);
-            }
-            // `debugOnly` and `prodOnly` are boolean flags you can put on a
-            // package, currently undocumented.  when set to true, they cause
-            // a package's code to be only included (i.e. linked into the bundle)
-            // in dev mode or prod mode (`meteor --production`), and excluded
-            // otherwise.
-            //
-            // Notes:
-            //
-            // * These flags do not affect which packages or which versions are
-            //   are selected by the version solver.
-            //
-            // * When you use a debugOnly or prodOnly package, its exports are
-            //   not imported for you.  You have to access them using
-            //   `Package["my-package"].MySymbol`.
-            //
-            // * These flags CAN cause different package load orders in
-            //   development and production!  We should probably fix this.
-            //   Basically, packages that are excluded from the build using
-            //   these flags are also excluded fro the build order calculation,
-            //   and that's the problem
-            //
-            // * We should consider publicly documenting these flags, since they
-            //   are effectively part of the public API.
-          } else if (key === "debugOnly") {
-            self.debugOnly = !!value;
-          } else if (key === "prodOnly") {
-            self.prodOnly = !!value;
-          } else {
-            // Do nothing. We might want to add some keys later, and we should err
-            // on the side of backwards compatibility.
-          }
-          if (self.debugOnly && self.prodOnly) {
-            buildmessage.error("Package can't have both debugOnly and prodOnly set.");
-          }
-        });
-      },
-
-      /**
-       * @summary Define package dependencies and expose package methods.
-       * @locus package.js
-       * @memberOf Package
-       * @param {Function} func A function that takes in the package control `api` object, which keeps track of dependencies and exports.
-       */
-      onUse: function (f) {
-        if (!self.isTest) {
-          if (fileAndDepLoader) {
-            buildmessage.error("duplicate onUse handler; a package may have " +
-                               "only one", { useMyCaller: true });
-            // Recover by ignoring the duplicate
-            return;
-          }
-          fileAndDepLoader = f;
-        }
-      },
-
-      /**
-       * @deprecated in 0.9.0
-       */
-      on_use: function (f) {
-        this.onUse(f);
-      },
-
-      /**
-       * @summary Define dependencies and expose package methods for unit tests.
-       * @locus package.js
-       * @memberOf Package
-       * @param {Function} func A function that takes in the package control 'api' object, which keeps track of dependencies and exports.
-       */
-      onTest: function (f) {
-        // If we are not initializing the test package, then we are initializing
-        // the normal package and have now noticed that it has tests. So, let's
-        // register the test. This is a medium-length hack until we have new
-        // control files.
-        if (!self.isTest) {
-          hasTests = true;
-          return;
-        }
-
-        // We are initializing the test, so proceed as normal.
-        if (self.isTest) {
-          if (fileAndDepLoader) {
-            buildmessage.error("duplicate onTest handler; a package may have " +
-                               "only one", { useMyCaller: true });
-            // Recover by ignoring the duplicate
-            return;
-          }
-          fileAndDepLoader = f;
-        }
-      },
-
-      /**
-       * @deprecated in 0.9.0
-       */
-      on_test: function (f) {
-        this.onTest(f);
-      },
-
-      // Define a plugin. A plugin extends the build process for
-      // targets that use this package. For example, a Coffeescript
-      // compiler would be a plugin. A plugin is its own little
-      // program, with its own set of source files, used packages, and
-      // npm dependencies.
-      //
-      // This is an experimental API and for now you should assume
-      // that it will change frequently and radically (thus the
-      // '_transitional_'). For maximum R&D velocity and for the good
-      // of the platform, we will push changes that break your
-      // packages that use this API. You've been warned.
-      //
-      // Options:
-      // - name: a name for this plugin. required (cosmetic -- string)
-      // - use: package to use for the plugin (names, as strings)
-      // - sources: sources for the plugin (array of string)
-      // - npmDependencies: map from npm package name to required
-      //   version (string)
-
-      /**
-       * @summary Define a build plugin. A build plugin extends the build
-       * process for apps and packages that use this package. For example,
-       * the `coffeescript` package uses a build plugin to compile CoffeeScript
-       * source files into JavaScript.
-       * @param  {Object} [options]
-       * @param {String} options.name A cosmetic name, must be unique in the
-       * package.
-       * @param {String|String[]} options.use Meteor packages that this
-       * plugin uses, independent of the packages specified in
-       * [api.onUse](#pack_onUse).
-       * @param {String[]} options.sources The source files that make up the
-       * build plugin, independent from [api.addFiles](#pack_addFiles).
-       * @param {Object} options.npmDependencies An object where the keys
-       * are NPM package names, and the keys are the version numbers of
-       * required NPM packages, just like in [Npm.depends](#Npm-depends).
-       * @memberOf Package
-       * @locus package.js
-       */
-      registerBuildPlugin: function (options) {
-        // Tests don't have plugins; plugins initialized in the control file
-        // belong to the package and not to the test. (This will be less
-        // confusing in the new control file format).
-        if (self.isTest) {
-          return;
-        }
-
-        if (! ('name' in options)) {
-          buildmessage.error("build plugins require a name",
-                             { useMyCaller: true });
-          // recover by ignoring plugin
-          return;
-        }
-
-        if (options.name in self.pluginInfo) {
-          buildmessage.error("this package already has a plugin named '" +
-                             options.name + "'",
-                             { useMyCaller: true });
-          // recover by ignoring plugin
-          return;
-        }
-
-        if (options.name.match(/\.\./) || options.name.match(/[\\\/]/)) {
-          buildmessage.error("bad plugin name", { useMyCaller: true });
-          // recover by ignoring plugin
-          return;
-        }
-
-        // XXX probably want further type checking
-        self.pluginInfo[options.name] = options;
-      },
-
-      /**
-       * @deprecated in 0.9.4
-       */
-      _transitional_registerBuildPlugin: function (options) {
-        this.registerBuildPlugin(options);
-      },
-
-      includeTool: function () {
-        if (!files.inCheckout()) {
-          buildmessage.error("Package.includeTool() can only be used with a " +
-                             "checkout of meteor");
-        } else if (self.includeTool) {
-          buildmessage.error("Duplicate includeTool call");
-        } else {
-          self.includeTool = true;
-        }
-      }
-    };
-
-    // == 'Npm' object visible in package.js ==
+    const Package = new PackageNamespace(this);
 
     /**
      * @namespace Npm
      * @global
      * @summary The Npm object in package.js and package source files.
      */
-    var Npm = {
-      /**
-       * @summary Specify which [NPM](https://www.npmjs.org/) packages
-       * your Meteor package depends on.
-       * @param  {Object} dependencies An object where the keys are package
-       * names and the values are version numbers in string form or URLs to a
-       * git commit by SHA.  You can only depend on exact versions of NPM
-       * packages. Example:
-       *
-       * ```js
-       * Npm.depends({
-       *   moment: "2.8.3",
-       *   async: "https://github.com/caolan/async/archive/71fa2638973dafd8761fa5457c472a312cc820fe.tar.gz"
-       * });
-       * ```
-       * @locus package.js
-       * @memberOf  Npm
-       */
-      depends: function (_npmDependencies) {
-        // XXX make npmDependencies be separate between use and test, so that
-        // production doesn't have to ship all of the npm modules used by test
-        // code
-        if (npmDependencies) {
-          buildmessage.error("Npm.depends may only be called once per package",
-                             { useMyCaller: true });
-          // recover by ignoring the Npm.depends line
-          return;
-        }
-        if (typeof _npmDependencies !== 'object') {
-          buildmessage.error("the argument to Npm.depends should be an " +
-                             "object, like this: {gcd: '0.0.0'}",
-                             { useMyCaller: true });
-          // recover by ignoring the Npm.depends line
-          return;
-        }
-
-        // don't allow npm fuzzy versions so that there is complete
-        // consistency when deploying a meteor app
-        //
-        // XXX use something like seal or lockdown to have *complete*
-        // confidence we're running the same code?
-        try {
-          utils.ensureOnlyExactVersions(_npmDependencies);
-        } catch (e) {
-          buildmessage.error(e.message, { useMyCaller: true, downcase: true });
-          // recover by ignoring the Npm.depends line
-          return;
-        }
-
-        npmDependencies = _npmDependencies;
-      },
-
-      // The `Npm.strip` method makes up for packages that have missing
-      // or incomplete .npmignore files by telling the bundler to strip out
-      // certain unnecessary files and/or directories during `meteor build`.
-      //
-      // The `discards` parameter should be an object whose keys are
-      // top-level package names and whose values are arrays of strings
-      // (or regular expressions) that match paths in that package's
-      // directory that should be stripped before installation. For
-      // example:
-      //
-      //   Npm.strip({
-      //     connect: [/*\.wmv$/],
-      //     useragent: ["tests/"]
-      //   });
-      //
-      // This means (1) "remove any files with the `.wmv` extension from
-      // the 'connect' package directory" and (2) "remove the 'tests'
-      // directory from the 'useragent' package directory."
-      strip: function(discards) {
-        self.npmDiscards.merge(discards);
-      },
-
-      require: function (name) {
-        try {
-          return require(name); // from the dev bundle
-        } catch (e) {
-          buildmessage.error(
-            "can't find npm module '" + name +
-              "'. In package.js, Npm.require can only find built-in modules.",
-            { useMyCaller: true });
-          // recover by, uh, returning undefined, which is likely to
-          // have some knock-on effects
-          return undefined;
-        }
-      }
-    };
-
-    // == 'Cordova' object visible in package.js ==
+    const Npm = new PackageNpm();
 
     /**
      * @namespace Cordova
      * @global
      * @summary The Cordova object in package.js.
      */
-    var Cordova = {
-      /**
-       * @summary Specify which [Cordova / PhoneGap](http://cordova.apache.org/)
-       * plugins your Meteor package depends on.
-       *
-       * Plugins are installed from
-       * [plugins.cordova.io](http://plugins.cordova.io/), so the plugins and
-       * versions specified must exist there. Alternatively, the version
-       * can be replaced with a GitHub tarball URL as described in the
-       * [Cordova / PhoneGap](https://github.com/meteor/meteor/wiki/Meteor-Cordova-Phonegap-integration#meteor-packages-with-cordovaphonegap-dependencies)
-       * page of the Meteor wiki on GitHub.
-       * @param  {Object} dependencies An object where the keys are plugin
-       * names and the values are version numbers or GitHub tarball URLs
-       * in string form.
-       * Example:
-       *
-       * ```js
-       * Cordova.depends({
-       *   "org.apache.cordova.camera": "0.3.0"
-       * });
-       * ```
-       *
-       * Alternatively, with a GitHub URL:
-       *
-       * ```js
-       * Cordova.depends({
-       *   "org.apache.cordova.camera":
-       *     "https://github.com/apache/cordova-plugin-camera/tarball/d84b875c"
-       * });
-       * ```
-       *
-       * @locus package.js
-       * @memberOf  Cordova
-       */
-      depends: function (_cordovaDependencies) {
-        // XXX make cordovaDependencies be separate between use and test, so that
-        // production doesn't have to ship all of the npm modules used by test
-        // code
-        if (cordovaDependencies) {
-          buildmessage.error("Cordova.depends may only be called once per package",
-                             { useMyCaller: true });
-          // recover by ignoring the Cordova.depends line
-          return;
-        }
-        if (typeof _cordovaDependencies !== 'object') {
-          buildmessage.error("the argument to Cordova.depends should be an " +
-                             "object, like this: {gcd: '0.0.0'}",
-                             { useMyCaller: true });
-          // recover by ignoring the Cordova.depends line
-          return;
-        }
-
-        // don't allow cordova fuzzy versions so that there is complete
-        // consistency when deploying a meteor app
-        //
-        // XXX use something like seal or lockdown to have *complete*
-        // confidence we're running the same code?
-        try {
-          utils.ensureOnlyExactVersions(_cordovaDependencies);
-        } catch (e) {
-          buildmessage.error(e.message, { useMyCaller: true, downcase: true });
-          // recover by ignoring the Npm.depends line
-          return;
-        }
-
-        cordovaDependencies = _cordovaDependencies;
-      },
-    };
+    const Cordova = new PackageCordova();
 
     try {
-      files.runJavaScript(code.toString('utf8'), {
+      files.runJavaScript(packageJsCode.toString('utf8'), {
         filename: 'package.js',
-        symbols: { Package: Package, Npm: Npm, Cordova: Cordova }
+        symbols: { Package, Npm, Cordova }
       });
     } catch (e) {
       buildmessage.exception(e);
@@ -985,10 +557,10 @@ _.extend(PackageSource.prototype, {
       // out to feel pretty disconcerting -- definitely violates the
       // principle of least surprise.) Leave the metadata if we have
       // it, though.
-      fileAndDepLoader = null;
+      Package._fileAndDepLoader = null;
       self.pluginInfo = {};
-      npmDependencies = null;
-      cordovaDependencies = null;
+      Npm._dependencies = null;
+      Cordova._dependencies = null;
     }
 
     // In the past, we did not require a Package.Describe.name field. So, it is
@@ -1006,8 +578,9 @@ _.extend(PackageSource.prototype, {
     try {
       utils.validatePackageName(self.name);
     } catch (e) {
-      if (!e.versionParserError)
+      if (!e.versionParserError) {
         throw e;
+      }
       buildmessage.error(e.message);
       // recover by ignoring
     }
@@ -1021,9 +594,9 @@ _.extend(PackageSource.prototype, {
     // to exclude in production mode from a published package. Eventually, we'll
     // add such a flag to the isopack format, but until then we'll sidestep the
     // issue by disallowing build plugins in debugOnly packages.
-    if (self.debugOnly && !_.isEmpty(self.pluginInfo)) {
+    if ((self.debugOnly || self.prodOnly || self.testOnly) && !_.isEmpty(self.pluginInfo)) {
       buildmessage.error(
-        "can't register build plugins in debugOnly packages");
+        "can't register build plugins in debugOnly, prodOnly or testOnly packages");
       // recover by ignoring
     }
 
@@ -1040,13 +613,13 @@ _.extend(PackageSource.prototype, {
     // probably is sufficient for virtually all packages that actually
     // exist in the field, if not every single one. #OldStylePackageSupport
 
-    var api = new packageAPIModule.PackageAPI({
-      buildingIsopackets: !!initFromPackageDirOptions.buildingIsopackets
+    var api = new PackageAPI({
+      buildingIsopackets: !! initFromPackageDirOptions.buildingIsopackets
     });
 
-    if (fileAndDepLoader) {
+    if (Package._fileAndDepLoader) {
       try {
-        buildmessage.markBoundary(fileAndDepLoader)(api);
+        buildmessage.markBoundary(Package._fileAndDepLoader)(api);
       } catch (e) {
         console.log(e.stack); // XXX should we keep this here -- or do we want broken
                               // packages to fail silently?
@@ -1064,10 +637,10 @@ _.extend(PackageSource.prototype, {
           };
         });
 
-        fileAndDepLoader = null;
+        Package._fileAndDepLoader = null;
         self.pluginInfo = {};
-        npmDependencies = null;
-        cordovaDependencies = null;
+        Npm._dependencies = null;
+        Cordova._dependencies = null;
       }
     }
 
@@ -1116,7 +689,9 @@ _.extend(PackageSource.prototype, {
             newConstraint.push(packages[dep.package]);
           }
         });
-        if (_.isEmpty(newConstraint)) return dep;
+        if (_.isEmpty(newConstraint)) {
+          return dep;
+        }
         dep.constraint = _.reduce(newConstraint,
           function(x, y) {
             return x + " || " + y;
@@ -1151,21 +726,10 @@ _.extend(PackageSource.prototype, {
     // dirs for use vs test?
     self.npmCacheDirectory =
       files.pathResolve(files.pathJoin(self.sourceRoot, '.npm', 'package'));
-    self.npmDependencies = npmDependencies;
+    self.npmDependencies = Npm._dependencies;
+    self.npmDiscards = Npm._discards;
 
-    self.cordovaDependencies = cordovaDependencies;
-
-    // If this package was previously built with pre-linker versions,
-    // it may have files directly inside `.npm` instead of nested
-    // inside `.npm/package`. Clean them up if they are there. (Kind
-    // of grody to do this here but it'll be fine for now, especially
-    // since this is only for compatibility with very old versions of
-    // Meteor.)
-    var preLinkerFiles = [
-      'npm-shrinkwrap.json', 'README', '.gitignore', 'node_modules'];
-    _.each(preLinkerFiles, function (f) {
-      files.rm_recursive(files.pathJoin(self.sourceRoot, '.npm', f));
-    });
+    self.cordovaDependencies = Cordova._dependencies;
 
     // Create source architectures, one for the server and one for each web
     // arch.
@@ -1183,8 +747,9 @@ _.extend(PackageSource.prototype, {
               !! _.find(api.uses[arch], function (u) {
                 return u.package === "meteor";
               });
-        if (! alreadyDependsOnMeteor)
+        if (! alreadyDependsOnMeteor) {
           api.uses[arch].unshift({ package: "meteor" });
+        }
       }
 
       // Each unibuild has its own separate WatchSet. This is so that, eg, a test
@@ -1192,15 +757,49 @@ _.extend(PackageSource.prototype, {
       // pluginWatchSet of a package that uses it: only the use unibuild's
       // dependencies need to go there!
       var watchSet = new watch.WatchSet();
-      watchSet.addFile(packageJsPath, packageJsHash);
+      watchPackageFiles(watchSet);
 
       self.architectures.push(new SourceArch(self, {
         kind: "main",
         arch: arch,
+        sourceRoot: self.sourceRoot,
         uses: api.uses[arch],
         implies: api.implies[arch],
-        getFiles: function () {
-          return api.files[arch];
+        getFiles(sourceProcessorSet, watchSet) {
+          const result = api.files[arch];
+          const relPathToSourceObj = {};
+          const sources = result.sources;
+
+          // Files explicitly passed to api.addFiles remain at the
+          // beginning of api.files[arch].sources in their given order.
+          sources.forEach(sourceObj => {
+            relPathToSourceObj[sourceObj.relPath] = sourceObj;
+          });
+
+          self._findSources({
+            sourceProcessorSet,
+            watchSet,
+            sourceArch: this,
+            isApp: false
+          }).forEach(relPath => {
+            if (! _.has(relPathToSourceObj, relPath)) {
+              const fileOptions = self._inferFileOptions(relPath, {
+                arch,
+                isApp: false,
+              });
+
+              // Since this file was not explicitly added with
+              // api.addFiles, it should not be evaluated eagerly.
+              fileOptions.lazy = true;
+
+              sources.push(relPathToSourceObj[relPath] = {
+                relPath,
+                fileOptions,
+              });
+            }
+          });
+
+          return result;
         },
         declaredExports: api.exports[arch],
         watchSet: watchSet
@@ -1211,9 +810,16 @@ _.extend(PackageSource.prototype, {
     self.serveRoot = files.pathJoin('/packages/', self.name);
 
     // Name of the test.
-    if (hasTests) {
+    if (Package._hasTests) {
       self.testName = genTestName(self.name);
     }
+  }),
+
+  _readAndWatchDirectory(relDir, watchSet, {include, exclude, names}) {
+    return watch.readAndWatchDirectory(watchSet, {
+      absPath: files.pathJoin(this.sourceRoot, relDir),
+      include, exclude, names
+    }).map(name => files.pathJoin(relDir, name));
   },
 
   // Initialize a package from an application directory (has .meteor/packages).
@@ -1223,9 +829,6 @@ _.extend(PackageSource.prototype, {
     self.name = null;
     self.sourceRoot = appDir;
     self.serveRoot = '/';
-
-    // special files those are excluded from app's top-level sources
-    var controlFiles = ['mobile-config.js'];
 
     // Determine used packages. Note that these are the same for all arches,
     // because there's no way to specify otherwise in .meteor/packages.
@@ -1252,169 +855,62 @@ _.extend(PackageSource.prototype, {
       var sourceArch = new SourceArch(self, {
         kind: 'app',
         arch: arch,
-        uses: uses
+        sourceRoot: self.sourceRoot,
+        uses: uses,
+        getFiles(sourceProcessorSet, watchSet) {
+          sourceProcessorSet.watchSet = watchSet;
+
+          const findOptions = {
+            sourceProcessorSet,
+            watchSet,
+            sourceArch: this,
+            ignoreFiles,
+            isApp: true,
+            loopChecker: new SymlinkLoopChecker(self.sourceRoot)
+          };
+
+          return {
+            sources: self._findSources(findOptions).sort(
+              loadOrderSort(sourceProcessorSet, arch)
+            ).map(relPath => {
+              return {
+                relPath,
+                fileOptions: self._inferFileOptions(relPath, {
+                  arch,
+                  isApp: true,
+                }),
+              };
+            }),
+
+            assets: self._findAssets(findOptions),
+          };
+        }
       });
+
+      const origAppDir = projectContext.getOriginalAppDirForTestPackages();
+
+      const origNodeModulesDir = origAppDir &&
+        files.pathJoin(origAppDir, "node_modules");
+
+      const origNodeModulesStat = origNodeModulesDir &&
+        files.statOrNull(origNodeModulesDir);
+
+      if (origNodeModulesStat &&
+          origNodeModulesStat.isDirectory()) {
+        sourceArch.localNodeModulesDirs["node_modules"] = {
+          // Override these properties when calling
+          // addNodeModulesDirectory in compileUnibuild.
+          sourceRoot: origAppDir,
+          sourcePath: origNodeModulesDir,
+          local: false,
+        };
+      }
+
       self.architectures.push(sourceArch);
 
       // sourceArch's WatchSet should include all the project metadata files
       // read by the ProjectContext.
       sourceArch.watchSet.merge(projectWatchSet);
-
-      // Determine source files
-      sourceArch.getFiles = (sourceProcessorSet, watchSet) => {
-        const sourceReadOptions =
-                sourceProcessorSet.appReadDirectoryOptions(arch);
-        // Ignore files starting with dot (unless they are explicitly in
-        // 'names').
-        sourceReadOptions.exclude.push(/^\./);
-        // Ignore the usual ignorable files.
-        sourceReadOptions.exclude.push(...ignoreFiles);
-
-        // Wrapper around watch.readAndWatchDirectory which takes in and returns
-        // sourceRoot-relative directories.
-        var readAndWatchDirectory = (relDir, {include, exclude, names}) => {
-          var absPath = files.pathJoin(self.sourceRoot, relDir);
-          var contents = watch.readAndWatchDirectory(
-            watchSet, {absPath, include, exclude, names});
-          return contents.map(x => files.pathJoin(relDir, x));
-        };
-
-        // Read top-level source files.
-        var sources = readAndWatchDirectory('', sourceReadOptions);
-
-        // don't include watched but not included control files
-        sources = _.difference(sources, controlFiles);
-
-        var otherUnibuildRegExp =
-              (arch === "os" ? /^client\/$/ : /^server\/$/);
-
-        // The paths that we've called checkForInfiniteRecursion on.
-        var seenPaths = {};
-        // Used internally by files.realpath as an optimization.
-        var realpathCache = {};
-        var checkForInfiniteRecursion = function (relDir) {
-          var absPath = files.pathJoin(self.sourceRoot, relDir);
-          try {
-            var realpath = files.realpath(absPath, realpathCache);
-          } catch (e) {
-            if (!e || e.code !== 'ELOOP')
-              throw e;
-            // else leave realpath undefined
-          }
-          if (realpath === undefined || _.has(seenPaths, realpath)) {
-            buildmessage.error("Symlink cycle detected at " + relDir);
-            // recover by returning no files
-            return true;
-          }
-          seenPaths[realpath] = true;
-          return false;
-        };
-
-        // Read top-level subdirectories. Ignore subdirectories that have
-        // special handling.
-        var sourceDirectories = readAndWatchDirectory('', {
-          include: [/\/$/],
-          exclude: [/^packages\/$/, /^tests\/$/,
-                    // XXX We no longer actually have special handling
-                    //     for the programs subdirectory, but let's not
-                    //     suddenly start treating it as part of the main
-                    //     app program.
-                    /^programs\/$/,
-                    // node.js based tooling often uses dependencies which
-                    // are installed into node_modules in the root of the
-                    // project.
-                    /^node_modules\/$/,
-                    /^public\/$/, /^private\/$/,
-                    /^cordova-build-override\/$/,
-                    otherUnibuildRegExp].concat(sourceReadOptions.exclude)
-        });
-        checkForInfiniteRecursion('');
-
-        while (!_.isEmpty(sourceDirectories)) {
-          var dir = sourceDirectories.shift();
-
-          // remove trailing slash
-          dir = dir.substr(0, dir.length - 1);
-
-          if (checkForInfiniteRecursion(dir))
-            return [];  // pretend we found no files
-
-          // Find source files in this directory.
-          sources.push(...readAndWatchDirectory(dir, sourceReadOptions));
-
-          // Find sub-sourceDirectories. Note that we DON'T need to ignore the
-          // directory names that are only special at the top level.
-          sourceDirectories.push(...readAndWatchDirectory(dir, {
-            include: [/\/$/],
-            exclude: [/^tests\/$/, otherUnibuildRegExp].concat(
-              sourceReadOptions.exclude)
-          }));
-        }
-
-        // We've found all the source files. Sort them!
-        sources.sort(loadOrderSort(sourceProcessorSet, arch));
-
-        // Convert into relPath/fileOptions objects.
-        sources = _.map(sources, function (relPath) {
-          var sourceObj = {relPath: relPath};
-
-          // Special case: on the client, JavaScript files in a
-          // `client/compatibility` directory don't get wrapped in a closure.
-          if (archinfo.matches(arch, "web") && relPath.match(/\.js$/)) {
-            var clientCompatSubstr =
-              files.pathSep + 'client' +
-              files.pathSep + 'compatibility' + files.pathSep;
-
-            if ((files.pathSep + relPath).indexOf(clientCompatSubstr) !== -1)
-              sourceObj.fileOptions = {bare: true};
-          }
-          return sourceObj;
-        });
-
-        // Now look for assets for this unibuild.
-        const assetDir = archinfo.matches(arch, "web") ? "public/" : "private/";
-        var assetDirs = readAndWatchDirectory('', {names: [assetDir]});
-
-        const assets = [];
-
-        if (!_.isEmpty(assetDirs)) {
-          if (!_.isEqual(assetDirs, [assetDir]))
-            throw new Error("Surprising assetDirs: " + JSON.stringify(assetDirs));
-
-          while (!_.isEmpty(assetDirs)) {
-            dir = assetDirs.shift();
-            // remove trailing slash
-            dir = dir.substr(0, dir.length - 1);
-
-            if (checkForInfiniteRecursion(dir))
-              return [];  // pretend we found no files
-
-            // Find asset files in this directory.
-            var assetsAndSubdirs = readAndWatchDirectory(dir, {
-              include: [/.?/],
-              // we DO look under dot directories here
-              exclude: ignoreFiles
-            });
-
-            _.each(assetsAndSubdirs, function (item) {
-              if (item[item.length - 1] === '/') {
-                // Recurse on this directory.
-                assetDirs.push(item);
-              } else {
-                // This file is an asset.
-                assets.push({
-                  relPath: item
-                });
-              }
-            });
-          }
-        }
-
-        return {
-          sources,
-          assets
-        };
-      };
     });
 
     if (! self._checkCrossUnibuildVersionConstraints()) {
@@ -1424,6 +920,327 @@ _.extend(PackageSource.prototype, {
       throw new Error("conflicting constraints in a package?");
     }
   }),
+
+  _inferFileOptions(relPath, {arch, isApp}) {
+    const fileOptions = {};
+    const isTest = global.testCommandMetadata
+      && global.testCommandMetadata.isTest;
+    const isAppTest = global.testCommandMetadata
+      && global.testCommandMetadata.isAppTest;
+    const isTestFile = (isTest || isAppTest) && isTestFilePath(relPath);
+
+    // If running in test mode (`meteor test`), all files other than
+    // test files should be loaded lazily.
+    if (isTest && !isTestFile) {
+      fileOptions.lazy = true;
+    }
+
+    const dirs = files.pathDirname(relPath).split(files.pathSep);
+
+    for (var i = 0; i < dirs.length; ++i) {
+      let dir = dirs[i];
+
+      if (dir === "node_modules") {
+        fileOptions.lazy = true;
+        fileOptions.transpile = false;
+
+        // Return immediately so that we don't apply special meanings to
+        // client or server directories inside node_modules directories.
+        return fileOptions;
+      }
+
+      // Files in `imports/` should be lazily loaded *apart* from tests
+      if (isApp && dir === "imports" && !isTestFile) {
+        fileOptions.lazy = true;
+      }
+
+      // If the file is restricted to the opposite architecture, make sure
+      // it is not evaluated eagerly.
+      if (archinfo.matches(arch, "os")) {
+        if (dir === "client") {
+          fileOptions.lazy = true;
+        }
+      } else if (dir === "server") {
+        fileOptions.lazy = true;
+      }
+
+      // Special case: in app code on the client, JavaScript files in a
+      // `client/compatibility` directory don't get wrapped in a closure.
+      if (i > 0 &&
+          dirs[i - 1] === "client" &&
+          dir === "compatibility" &&
+          isApp && // Skip this check for packages.
+          archinfo.matches(arch, "web") &&
+          relPath.endsWith(".js")) {
+        fileOptions.bare = true;
+      }
+    }
+
+    return fileOptions;
+  },
+
+  // This cache survives for the duration of the process, and stores the
+  // complete list of source files for directories within node_modules.
+  _findSourcesCache: Object.create(null),
+
+  _findSources({
+    sourceProcessorSet,
+    watchSet,
+    isApp,
+    sourceArch,
+    loopChecker = new SymlinkLoopChecker(this.sourceRoot),
+    ignoreFiles = []
+  }) {
+    const self = this;
+    const arch = sourceArch.arch;
+    const sourceReadOptions =
+      sourceProcessorSet.appReadDirectoryOptions(arch);
+
+    // Adding, removing, or modifying a .meteorignore file should trigger
+    // a rebuild with the new rules applied.
+    sourceReadOptions.names.push(".meteorignore");
+
+    // Ignore files starting with dot (unless they are explicitly in
+    // sourceReadOptions.names, e.g. .meteorignore, added above).
+    sourceReadOptions.exclude.push(/^\./);
+
+    // Ignore the usual ignorable files.
+    sourceReadOptions.exclude.push(...ignoreFiles);
+
+    // Unless we're running tests, ignore all test filenames and if we are, ignore the
+    // type of file we *aren't* running
+    if (!global.testCommandMetadata || global.testCommandMetadata.isTest) {
+      Array.prototype.push.apply(sourceReadOptions.exclude, APP_TEST_FILENAME_REGEXPS);
+    }
+    if (!global.testCommandMetadata || global.testCommandMetadata.isAppTest) {
+      Array.prototype.push.apply(sourceReadOptions.exclude, TEST_FILENAME_REGEXPS);
+    }
+
+    // Read top-level source files, excluding control files that were not
+    // explicitly included.
+    const controlFiles = ['mobile-config.js'];
+
+    if (! isApp) {
+      controlFiles.push('package.js');
+    }
+
+    const anyLevelExcludes = [
+      /^tests\/$/,
+      archinfo.matches(arch, "os")
+        ? /^client\/$/
+        : /^server\/$/,
+      ...sourceReadOptions.exclude,
+    ];
+
+    const topLevelExcludes = isApp ? [
+      ...anyLevelExcludes,
+      /^packages\/$/,
+      /^programs\/$/,
+      /^public\/$/, /^private\/$/,
+      /^cordova-build-override\/$/,
+      /^acceptance-tests\/$/,
+    ] : anyLevelExcludes;
+
+    const nodeModulesReadOptions = {
+      ...sourceReadOptions,
+      // When we're in a node_modules directory, we can avoid collecting
+      // .js and .json files, because (unlike .less or .coffee files) they
+      // are allowed to be imported later by the ImportScanner, as they do
+      // not require custom processing by compiler plugins.
+      exclude: sourceReadOptions.exclude.concat(/\.js(on)?$/i),
+    };
+
+    const baseCacheKey = JSON.stringify({
+      isApp,
+      arch,
+      sourceRoot: self.sourceRoot,
+      excludes: anyLevelExcludes,
+    }, (key, value) => {
+      if (_.isRegExp(value)) {
+        return [value.source, value.flags];
+      }
+      return value;
+    });
+
+    function makeCacheKey(dir) {
+      return baseCacheKey + "\0" + dir;
+    }
+
+    const dotMeteorIgnoreFiles = Object.create(null);
+
+    function find(dir, depth, inNodeModules) {
+      // Remove trailing slash.
+      dir = dir.replace(/\/$/, "");
+
+      // If we're in a node_modules directory, cache the results of the
+      // find function for the duration of the process.
+      const cacheKey = inNodeModules && makeCacheKey(dir);
+      if (cacheKey &&
+          cacheKey in self._findSourcesCache) {
+        return self._findSourcesCache[cacheKey];
+      }
+
+      if (loopChecker.check(dir)) {
+        // Pretend we found no files.
+        return [];
+      }
+
+      const absDir = files.pathJoin(self.sourceRoot, dir);
+      if (! inNodeModules) {
+        const ignore = optimisticReadMeteorIgnore(absDir);
+        if (ignore) {
+          dotMeteorIgnoreFiles[dir] = ignore;
+        }
+      }
+
+      const readOptions = inNodeModules
+        ? nodeModulesReadOptions
+        : sourceReadOptions;
+
+      const sources = _.difference(
+        self._readAndWatchDirectory(dir, watchSet, readOptions),
+        depth > 0 ? [] : controlFiles
+      );
+
+      const subdirectories = self._readAndWatchDirectory(dir, watchSet, {
+        include: [/\/$/],
+        exclude: depth > 0
+          ? anyLevelExcludes
+          : topLevelExcludes
+      });
+
+      Object.keys(dotMeteorIgnoreFiles).forEach(ignoreDir => {
+        const ignore = dotMeteorIgnoreFiles[ignoreDir];
+
+        function removeIgnoredFilesFrom(array) {
+          let target = 0;
+
+          array.forEach(item => {
+            let relPath = files.pathRelative(ignoreDir, item);
+
+            if (! relPath.startsWith("..")) {
+              if (item.endsWith("/")) {
+                // The trailing slash is discarded by files.pathRelative.
+                relPath += "/";
+              }
+
+              if (ignore.ignores(relPath)) {
+                return;
+              }
+            }
+
+            array[target++] = item;
+          });
+
+          array.length = target;
+        }
+
+        removeIgnoredFilesFrom(sources);
+        removeIgnoredFilesFrom(subdirectories);
+      });
+
+      let nodeModulesDir;
+
+      subdirectories.forEach(subdir => {
+        if (/(^|\/)node_modules\/$/.test(subdir)) {
+          if (! inNodeModules) {
+            sourceArch.localNodeModulesDirs[subdir] = true;
+          }
+
+          // Defer handling node_modules until after we handle all other
+          // subdirectories, so that we know whether we need to descend
+          // further. If sources is still empty after we handle everything
+          // else in dir, then nothing in this node_modules subdir can be
+          // imported by anthing outside of it, so we can ignore it.
+          nodeModulesDir = subdir;
+
+        } else {
+          sources.push(...find(subdir, depth + 1, inNodeModules));
+        }
+      });
+
+      // Don't apply any .meteorignore rules to files inside node_modules.
+      delete dotMeteorIgnoreFiles[dir];
+
+      if (isApp &&
+          nodeModulesDir &&
+          (! inNodeModules || sources.length > 0)) {
+        // If we found a node_modules subdirectory above, and either we
+        // are not already inside another node_modules directory or we
+        // found source files elsewhere in this directory or its other
+        // subdirectories, and we're building an app (as opposed to a
+        // Meteor package), continue searching this node_modules
+        // directory, so that any non-.js(on) files it contains can be
+        // imported by the app (#6037).
+        sources.push(...find(nodeModulesDir, depth + 1, true));
+      }
+
+      if (cacheKey) {
+        self._findSourcesCache[cacheKey] = sources;
+      }
+
+      return sources;
+    }
+
+    return files.withCache(() => find("", 0, false));
+  },
+
+  _findAssets({
+    sourceProcessorSet,
+    watchSet,
+    isApp,
+    sourceArch,
+    loopChecker = new SymlinkLoopChecker(this.sourceRoot),
+    ignoreFiles = [],
+  }) {
+    // Now look for assets for this unibuild.
+    const arch = sourceArch.arch;
+    const assetDir = archinfo.matches(arch, "web") ? "public/" : "private/";
+    var assetDirs = this._readAndWatchDirectory('', watchSet, {
+      names: [assetDir]
+    });
+
+    const assets = [];
+
+    if (!_.isEmpty(assetDirs)) {
+      if (!_.isEqual(assetDirs, [assetDir])) {
+        throw new Error("Surprising assetDirs: " + JSON.stringify(assetDirs));
+      }
+
+      while (!_.isEmpty(assetDirs)) {
+        dir = assetDirs.shift();
+        // remove trailing slash
+        dir = dir.substr(0, dir.length - 1);
+
+        if (loopChecker.check(dir)) {
+          // pretend we found no files
+          return [];
+        }
+
+        // Find asset files in this directory.
+        var assetsAndSubdirs = this._readAndWatchDirectory(dir, watchSet, {
+          include: [/.?/],
+          // we DO look under dot directories here
+          exclude: ignoreFiles
+        });
+
+        _.each(assetsAndSubdirs, function (item) {
+          if (item[item.length - 1] === '/') {
+            // Recurse on this directory.
+            assetDirs.push(item);
+          } else {
+            // This file is an asset. Make sure filenames are Unicode
+            // normalized.
+            assets.push({
+              relPath: item.normalize('NFC')
+            });
+          }
+        });
+      }
+    }
+
+    return assets;
+  },
 
   // True if the package defines any plugins.
   containsPlugins: function () {
@@ -1446,10 +1263,11 @@ _.extend(PackageSource.prototype, {
     options = options || {};
     var ret = self._computeDependencyMetadata(options);
     if (! ret) {
-      if (options.logError)
+      if (options.logError) {
         return null;
-      else
+      } else {
         throw new Error("inconsistent dependency constraint across unibuilds?");
+      }
     }
     return ret;
   },
@@ -1479,16 +1297,18 @@ _.extend(PackageSource.prototype, {
     var processUse = function (use) {
       // We don't have to build weak or unordered deps first (eg they can't
       // contribute to a plugin).
-      if (use.weak || use.unordered)
+      if (use.weak || use.unordered) {
         return;
+      }
       // Only include real packages, not isobuild:* pseudo-packages.
       if (compiler.isIsobuildFeaturePackage(use.package)) {
         return;
       }
 
       var packageInfo = packageMap.getInfo(use.package);
-      if (! packageInfo)
+      if (! packageInfo) {
         throw Error("Depending on unknown package " + use.package);
+      }
       packages[use.package] = true;
     };
 
@@ -1639,8 +1459,9 @@ _.extend(PackageSource.prototype, {
         // We can't really have a weak implies (what does that even mean?) but
         // we check for that elsewhere.
         if ((use.weak && options.skipWeak) ||
-            (use.unordered && options.skipUnordered))
+            (use.unordered && options.skipUnordered)) {
           return;
+        }
 
         if (!_.has(dependencies, use.package)) {
           dependencies[use.package] = {

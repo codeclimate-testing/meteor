@@ -4,6 +4,7 @@
 /// (such as testing whether an directory is a meteor app)
 ///
 
+var assert = require("assert");
 var fs = require("fs");
 var path = require('path');
 var os = require('os');
@@ -11,16 +12,15 @@ var util = require('util');
 var _ = require('underscore');
 var Fiber = require('fibers');
 var crypto = require('crypto');
+var spawn = require("child_process").spawn;
 
 var rimraf = require('rimraf');
-var Future = require('fibers/future');
 var sourcemap = require('source-map');
 var sourceMapRetrieverStack = require('../tool-env/source-map-retriever-stack.js');
 
 var utils = require('../utils/utils.js');
 var cleanup = require('../tool-env/cleanup.js');
 var buildmessage = require('../utils/buildmessage.js');
-var watch = require('./watch.js');
 var fiberHelpers = require('../utils/fiber-helpers.js');
 var colonConverter = require('../utils/colon-converter.js');
 
@@ -48,6 +48,19 @@ var useParsedSourceMap = function (pathForSourceMap) {
 // Try this source map first
 sourceMapRetrieverStack.push(useParsedSourceMap);
 
+// Fibers are disabled by default for files.* operations unless
+// process.env.METEOR_DISABLE_FS_FIBERS parses to a falsy value.
+const YIELD_ALLOWED = !! (
+  _.has(process.env, "METEOR_DISABLE_FS_FIBERS") &&
+  ! JSON.parse(process.env.METEOR_DISABLE_FS_FIBERS));
+
+function canYield() {
+  return YIELD_ALLOWED &&
+    Fiber.current &&
+    Fiber.yield &&
+    ! Fiber.yield.disallowed;
+}
+
 // given a predicate function and a starting path, traverse upwards
 // from the path until we find a path that satisfies the predicate.
 //
@@ -67,8 +80,9 @@ var findUpwards = function (predicate, startPath) {
       testDir = newDir;
     }
   }
-  if (!testDir)
+  if (!testDir) {
     return null;
+  }
 
   return testDir;
 };
@@ -124,7 +138,9 @@ files.addToGitignore = function (dirPath, entry) {
       // already there do nothing
     } else {
       // rewrite file w/ new entry.
-      if (data.substr(-1) !== "\n") data = data + "\n";
+      if (data.substr(-1) !== "\n") {
+        data = data + "\n";
+      }
       data = data + entry + "\n";
       files.writeFile(filepath, data, 'utf8');
     }
@@ -137,8 +153,9 @@ files.addToGitignore = function (dirPath, entry) {
 // Are we running Meteor from a git checkout?
 files.inCheckout = _.once(function () {
   try {
-    if (files.exists(files.pathJoin(files.getCurrentToolsDir(), '.git')))
+    if (files.exists(files.pathJoin(files.getCurrentToolsDir(), '.git'))) {
       return true;
+    }
   } catch (e) { console.log(e); }
 
   return false;
@@ -150,10 +167,11 @@ files.inCheckout = _.once(function () {
 files.usesWarehouse = function () {
   // Test hook: act like we're "installed" using a non-homedir warehouse
   // directory.
-  if (process.env.METEOR_WAREHOUSE_DIR)
+  if (process.env.METEOR_WAREHOUSE_DIR) {
     return true;
-  else
+  } else {
     return ! files.inCheckout();
+  }
 };
 
 // Read the '.tools_version.txt' file. If in a checkout, throw an error.
@@ -199,8 +217,9 @@ files.getCurrentNodeBinDir = function () {
 
 // Return the top-level directory for this meteor install or checkout
 files.getCurrentToolsDir = function () {
-  var dirname = files.convertToStandardPath(__dirname);
-  return files.pathJoin(dirname, '..', '..');
+  return files.pathDirname(
+    files.pathDirname(
+      files.convertToStandardPath(__dirname)));
 };
 
 // Read a settings file and sanity-check it. Returns a string on
@@ -209,7 +228,7 @@ files.getCurrentToolsDir = function () {
 files.getSettings = function (filename, watchSet) {
   buildmessage.assertInCapture();
   var absPath = files.pathResolve(filename);
-  var buffer = watch.readAndWatchFile(watchSet, absPath);
+  var buffer = require("./watch.js").readAndWatchFile(watchSet, absPath);
   if (buffer === null) {
     buildmessage.error("file not found (settings file)",
                        { file: filename });
@@ -243,33 +262,53 @@ files.getSettings = function (filename, watchSet) {
 files.prettyPath = function (p) {
   p = files.realpath(p);
   var home = files.getHomeDir();
-  if (! home)
+  if (! home) {
     return p;
+  }
   var relativeToHome = files.pathRelative(home, p);
-  if (relativeToHome.substr(0, 3) === ('..' + files.pathSep))
+  if (relativeToHome.substr(0, 3) === ('..' + files.pathSep)) {
     return p;
+  }
   return files.pathJoin('~', relativeToHome);
 };
 
 // Like statSync, but null if file not found
 files.statOrNull = function (path) {
+  return statOrNull(path);
+};
+
+function statOrNull(path, preserveSymlinks) {
   try {
-    return files.stat(path);
+    return preserveSymlinks
+      ? files.lstat(path)
+      : files.stat(path);
   } catch (e) {
-    if (e.code == "ENOENT")
+    if (e.code === "ENOENT") {
       return null;
+    }
     throw e;
   }
+}
+
+files.rm_recursive_async = (path) => {
+  return new Promise((resolve, reject) => {
+    rimraf(files.convertToOSPath(path), err => err
+      ? reject(err)
+      : resolve());
+  });
 };
 
 // Like rm -r.
-files.rm_recursive = Profile("files.rm_recursive", function (p) {
-  if (Fiber.current && Fiber.yield && ! Fiber.yield.disallowed) {
-    var fut = new Future();
-    rimraf(files.convertToOSPath(p), fut.resolver());
-    fut.wait();
-  } else {
-    rimraf.sync(files.convertToOSPath(p));
+files.rm_recursive = Profile("files.rm_recursive", (path) => {
+  try {
+    rimraf.sync(files.convertToOSPath(path));
+  } catch (e) {
+    if (e.code === "ENOTEMPTY" &&
+        canYield()) {
+      files.rm_recursive_async(path).await();
+      return;
+    }
+    throw e;
   }
 });
 
@@ -279,8 +318,9 @@ var makeTreeReadOnly = function (p) {
     // the l in lstat is critical -- we want to ignore symbolic links
     var stat = files.lstat(p);
   } catch (e) {
-    if (e.code == "ENOENT")
+    if (e.code == "ENOENT") {
       return;
+    }
     throw e;
   }
 
@@ -292,8 +332,9 @@ var makeTreeReadOnly = function (p) {
   if (stat.isFile()) {
     var permissions = stat.mode & 0o777;
     var readOnlyPermissions = permissions & 0o555;
-    if (permissions !== readOnlyPermissions)
+    if (permissions !== readOnlyPermissions) {
       files.chmod(p, readOnlyPermissions);
+    }
   }
 };
 
@@ -303,13 +344,13 @@ files.fileHash = function (filename) {
   var hash = crypto.createHash('sha256');
   hash.setEncoding('base64');
   var rs = files.createReadStream(filename);
-  var fut = new Future();
-  rs.on('end', function () {
-    rs.close();
-    fut.return(hash.digest('base64'));
-  });
-  rs.pipe(hash, { end: false });
-  return fut.wait();
+  return new Promise(function (resolve) {
+    rs.on('end', function () {
+      rs.close();
+      resolve(hash.digest('base64'));
+    });
+    rs.pipe(hash, { end: false });
+  }).await();
 };
 
 // This is the result of running fileHash on a blank file.
@@ -421,9 +462,7 @@ files.mkdir_p = function (dir, mode) {
   return pathIsDirectory(p);
 };
 
-// Roughly like cp -R. 'from' should be a directory. 'to' can either
-// be a directory, or it can not exist (in which case it will be
-// created with mkdir_p).
+// Roughly like cp -R.
 //
 // The output files will be readable and writable by everyone that the umask
 // allows, and executable by everyone (modulo umask) if the original file was
@@ -437,46 +476,63 @@ files.mkdir_p = function (dir, mode) {
 // If options.ignore is present, it should be a list of regexps. Any
 // file whose basename matches one of the regexps, before
 // transformation, will be skipped.
-files.cp_r = function (from, to, options) {
-  options = options || {};
+files.cp_r = function(from, to, options = {}) {
+  from = files.pathResolve(from);
 
-  var absFrom = files.pathResolve(from);
-  files.mkdir_p(to, 0o755);
+  const stat = statOrNull(from, options.preserveSymlinks);
+  if (! stat) {
+    return;
+  }
 
-  _.each(files.readdir(from), function (f) {
-    if (_.any(options.ignore || [], function (pattern) {
-      return f.match(pattern);
-    })) return;
+  if (stat.isDirectory()) {
+    files.mkdir_p(to, 0o755);
 
-    var fullFrom = files.pathJoin(from, f);
-    if (options.transformFilename)
-      f = options.transformFilename(f);
-    var fullTo = files.pathJoin(to, f);
-    var stats = options.preserveSymlinks
-          ? files.lstat(fullFrom) : files.stat(fullFrom);
-    if (stats.isDirectory()) {
-      files.cp_r(fullFrom, fullTo, options);
-    } else if (stats.isSymbolicLink()) {
-      var linkText = files.readlink(fullFrom);
-      files.symlink(linkText, fullTo);
-    } else {
-      var absFullFrom = files.pathResolve(fullFrom);
-
-      // Create the file as readable and writable by everyone, and executable by
-      // everyone if the original file is executably by owner. (This mode will
-      // be modified by umask.) We don't copy the mode *directly* because this
-      // function is used by 'meteor create' which is copying from the read-only
-      // tools tree into a writable app.
-      var mode = (stats.mode & 0o100) ? 0o777 : 0o666;
-      if (!options.transformContents) {
-        copyFileHelper(fullFrom, fullTo, mode);
-      } else {
-        var contents = files.readFile(fullFrom);
-        contents = options.transformContents(contents, f);
-        files.writeFile(fullTo, contents, { mode: mode });
+    files.readdir(from).forEach(f => {
+      if (options.ignore &&
+          _.any(options.ignore,
+                pattern => f.match(pattern))) {
+        return;
       }
+
+      const fullFrom = files.pathJoin(from, f);
+
+      if (options.transformFilename) {
+        f = options.transformFilename(f);
+      }
+
+      files.cp_r(
+        fullFrom,
+        files.pathJoin(to, f),
+        options
+      );
+    })
+
+    return;
+  }
+
+  files.mkdir_p(files.pathDirname(to));
+
+  if (stat.isSymbolicLink()) {
+    files.symlink(files.readlink(from), to);
+
+  } else {
+    // Create the file as readable and writable by everyone, and
+    // executable by everyone if the original file is executable by
+    // owner. (This mode will be modified by umask.) We don't copy the
+    // mode *directly* because this function is used by 'meteor create'
+    // which is copying from the read-only tools tree into a writable app.
+    const mode = (stat.mode & 0o100) ? 0o777 : 0o666;
+
+    if (options.transformContents) {
+      files.writeFile(to, options.transformContents(
+        files.readFile(from),
+        files.pathBasename(from)
+      ), { mode });
+
+    } else {
+      copyFileHelper(from, to, mode);
     }
-  });
+  }
 };
 
 /**
@@ -543,12 +599,15 @@ files.findPathsWithRegex = function (dir, regex, options) {
 // Copies a file, which is expected to exist. Parent directories of "to" do not
 // have to exist. Treats symbolic links transparently (copies the contents, not
 // the link itself, and it's an error if the link doesn't point to a file).
-files.copyFile = function (from, to) {
+files.copyFile = function (from, to, origMode=null) {
   files.mkdir_p(files.pathDirname(files.pathResolve(to)), 0o755);
 
-  var stats = files.stat(from);
-  if (!stats.isFile()) {
-    throw Error("cannot copy non-files");
+  if (origMode === null) {
+    var stats = files.stat(from);
+    if (!stats.isFile()) {
+      throw Error("cannot copy non-files");
+    }
+    origMode = stats.mode;
   }
 
   // Create the file as readable and writable by everyone, and executable by
@@ -556,27 +615,23 @@ files.copyFile = function (from, to) {
   // modified by umask.) We don't copy the mode *directly* because this function
   // is used by 'meteor create' which is copying from the read-only tools tree
   // into a writable app.
-  var mode = (stats.mode & 0o100) ? 0o777 : 0o666;
+  var mode = (origMode & 0o100) ? 0o777 : 0o666;
 
   copyFileHelper(from, to, mode);
 };
+files.copyFile = Profile("files.copyFile", files.copyFile);
 
 var copyFileHelper = function (from, to, mode) {
   var readStream = files.createReadStream(from);
   var writeStream = files.createWriteStream(to, { mode: mode });
-  var future = new Future;
-  var onError = function (e) {
-    future.isResolved() || future.throw(e);
-  };
-  readStream.on('error', onError);
-  writeStream.on('error', onError);
-  writeStream.on('open', function () {
-    readStream.pipe(writeStream);
-  });
-  writeStream.once('finish', function () {
-    future.isResolved() || future.return();
-  });
-  future.wait();
+  new Promise(function (resolve, reject) {
+    readStream.on('error', reject);
+    writeStream.on('error', reject);
+    writeStream.on('open', function () {
+      readStream.pipe(writeStream);
+    });
+    writeStream.once('finish', resolve);
+  }).await();
 };
 
 // Make a temporary directory. Returns the path to the newly created
@@ -592,11 +647,13 @@ files.mkdtemp = function (prefix) {
       return process.env[t];
     }).filter(_.identity));
 
-    if (! tmpDir && process.platform !== 'win32')
+    if (! tmpDir && process.platform !== 'win32') {
       tmpDir = '/tmp';
+    }
 
-    if (! tmpDir)
+    if (! tmpDir) {
       throw new Error("Couldn't create a temporary directory.");
+    }
 
     tmpDir = files.realpath(tmpDir);
 
@@ -623,10 +680,12 @@ files.mkdtemp = function (prefix) {
 // Call this if you're done using a temporary directory. It will asynchronously
 // be deleted.
 files.freeTempDir = function (tempDir) {
-  if (! _.contains(tempDirs, tempDir))
+  if (! _.contains(tempDirs, tempDir)) {
     throw Error("not a tracked temp dir: " + tempDir);
-  if (process.env.METEOR_SAVE_TMPDIRS)
+  }
+  if (process.env.METEOR_SAVE_TMPDIRS) {
     return;
+  }
   setImmediate(function () {
     // note: rm_recursive can yield, so it's possible that during this
     // rm_recursive call, the onExit rm_recursive fires too.  (Or it could even
@@ -677,49 +736,171 @@ files.extractTarGz = function (buffer, destPath, options) {
   var tempDir = files.pathJoin(parentDir, '.tmp' + utils.randomToken());
   files.mkdir_p(tempDir);
 
-  var future = new Future;
+  if (! _.has(options, "verbose")) {
+    options.verbose = require("../console/console.js").Console.verbose;
+  }
 
-  var tar = require("tar");
-  var zlib = require("zlib");
-  var gunzip = zlib.createGunzip()
-    .on('error', function (e) {
-      future.isResolved() || future.throw(e);
-    });
+  const startTime = +new Date;
 
-  var extractor = new tar.Extract({ path: files.convertToOSPath(tempDir) })
-    .on('entry', function (e) {
-      if (process.platform === "win32" || options.forceConvert) {
-        // On Windows, try to convert old packages that have colons in paths
-        // by blindly replacing all of the paths. Otherwise, we can't even
-        // extract the tarball
-        e.path = colonConverter.convert(e.path);
-      }
-    })
-    .on('error', function (e) {
-      future.isResolved() || future.throw(e);
-    })
-    .on('end', function () {
-      future.isResolved() || future.return();
-    });
+  let promise = process.platform === "win32"
+    ? tryExtractWithNative7z(buffer, tempDir, options)
+    : tryExtractWithNativeTar(buffer, tempDir, options)
 
-  // write the buffer to the (gunzip|untar) pipeline; these calls
-  // cause the tar to be extracted to disk.
-  gunzip.pipe(extractor);
-  gunzip.write(buffer);
-  gunzip.end();
-  future.wait();
+  promise = promise.catch(
+    error => tryExtractWithNpmTar(buffer, tempDir, options)
+  );
+
+  promise.await();
 
   // succeed!
-  var topLevelOfArchive = files.readdir(tempDir);
-  if (topLevelOfArchive.length !== 1)
+  var topLevelOfArchive = files.readdir(tempDir)
+    // On Windows, the 7z.exe tool sometimes creates an auxiliary
+    // PaxHeader directory.
+    .filter(file => ! file.startsWith("PaxHeader"));
+
+  if (topLevelOfArchive.length !== 1) {
     throw new Error(
       "Extracted archive '" + tempDir + "' should only contain one entry");
+  }
 
   var extractDir = files.pathJoin(tempDir, topLevelOfArchive[0]);
   makeTreeReadOnly(extractDir);
   files.rename(extractDir, destPath);
-  files.rmdir(tempDir);
+  files.rm_recursive(tempDir);
+
+  if (options.verbose) {
+    console.log("Finished extracting in", new Date - startTime, "ms");
+  }
 };
+
+function ensureDirectoryEmpty(dir) {
+  files.readdir(dir).forEach(file => {
+    files.rm_recursive(files.pathJoin(dir, file));
+  });
+}
+
+function tryExtractWithNativeTar(buffer, tempDir, options) {
+  ensureDirectoryEmpty(tempDir);
+
+  if (options.forceConvert) {
+    return Promise.reject(new Error(
+      "Native tar cannot convert colons in package names"));
+  }
+
+  return new Promise((resolve, reject) => {
+    const flags = options.verbose ? "-xzvf" : "-xzf";
+    const tarProc = spawn("tar", [flags, "-"], {
+      cwd: files.convertToOSPath(tempDir),
+      stdio: options.verbose ? [
+        "pipe", // Always need to write to tarProc.stdin.
+        process.stdout,
+        process.stderr
+      ] : "pipe",
+    });
+
+    tarProc.on("error", reject);
+    tarProc.on("exit", resolve);
+
+    tarProc.stdin.write(buffer);
+    tarProc.stdin.end();
+  });
+}
+
+function tryExtractWithNative7z(buffer, tempDir, options) {
+  ensureDirectoryEmpty(tempDir);
+
+  if (options.forceConvert) {
+    return Promise.reject(new Error(
+      "Native 7z.exe cannot convert colons in package names"));
+  }
+
+  const exeOSPath = files.convertToOSPath(
+    files.pathJoin(files.getCurrentNodeBinDir(), "7z.exe"));
+  const tarGzBasename = "out.tar.gz";
+  const spawnOptions = {
+    cwd: files.convertToOSPath(tempDir),
+    stdio: options.verbose ? "inherit" : "pipe",
+  };
+
+  files.writeFile(files.pathJoin(tempDir, tarGzBasename), buffer);
+
+  return new Promise((resolve, reject) => {
+    spawn(exeOSPath, [
+      "x", "-y", tarGzBasename
+    ], spawnOptions)
+      .on("error", reject)
+      .on("exit", resolve);
+
+  }).then(code => {
+    assert.strictEqual(code, 0);
+
+    let tarBasename;
+    const foundTar = files.readdir(tempDir).some(file => {
+      if (file !== tarGzBasename) {
+        tarBasename = file;
+        return true;
+      }
+    });
+
+    assert.ok(foundTar, "failed to find .tar file");
+
+    function cleanUp() {
+      files.unlink(files.pathJoin(tempDir, tarGzBasename));
+      files.unlink(files.pathJoin(tempDir, tarBasename));
+    }
+
+    return new Promise((resolve, reject) => {
+      spawn(exeOSPath, [
+        "x", "-y", tarBasename
+      ], spawnOptions)
+        .on("error", reject)
+        .on("exit", resolve);
+
+    }).then(code => {
+      cleanUp();
+      return code;
+    }, error => {
+      cleanUp();
+      throw error;
+    });
+  });
+}
+
+function tryExtractWithNpmTar(buffer, tempDir, options) {
+  ensureDirectoryEmpty(tempDir);
+
+  var tar = require("tar");
+  var zlib = require("zlib");
+
+  return new Promise((resolve, reject) => {
+    var gunzip = zlib.createGunzip().on('error', reject);
+    var extractor = new tar.Extract({
+      path: files.convertToOSPath(tempDir)
+    }).on('entry', function (e) {
+      if (process.platform === "win32" || options.forceConvert) {
+        // On Windows, try to convert old packages that have colons in
+        // paths by blindly replacing all of the paths. Otherwise, we
+        // can't even extract the tarball
+        e.path = colonConverter.convert(e.path);
+      }
+    }).on('error', reject)
+      .on('end', resolve);
+
+    // write the buffer to the (gunzip|untar) pipeline; these calls
+    // cause the tar to be extracted to disk.
+    gunzip.pipe(extractor);
+    gunzip.write(buffer);
+    gunzip.end();
+  });
+}
+
+// In the same fashion as node-pre-gyp does, add the executable
+// bit but only if the read bit was present.  Same as:
+// https://github.com/mapbox/node-pre-gyp/blob/7a28f4b0f562ba4712722fefe4eeffb7b20fbf7a/lib/install.js#L71-L77
+// and others reported in: https://github.com/npm/node-tar/issues/7
+function addExecBitWhenReadBitPresent(fileMode) {
+  return fileMode |= (fileMode >>> 2) & 0o111;
+}
 
 // Tar-gzips a directory, returning a stream that can then be piped as
 // needed.  The tar archive will contain a top-level directory named
@@ -728,6 +909,12 @@ files.createTarGzStream = function (dirPath, options) {
   var tar = require("tar");
   var fstream = require('fstream');
   var zlib = require("zlib");
+
+  // Create a segment of the file path which we will look for to
+  // identify exactly what we think is a "bin" file (that is, something
+  // which should be expected to work within the context of an
+  // 'npm run-script').
+  var binPathMatch = ["", "node_modules", ".bin", ""].join(path.sep);
 
   // Don't use `{ path: dirPath, type: 'Directory' }` as an argument to
   // fstream.Reader. This triggers a collection of odd behaviors in fstream
@@ -768,8 +955,13 @@ files.createTarGzStream = function (dirPath, options) {
       // setting it in an 'entry' handler is the same strategy that npm
       // does, so we do that here too.
       if (entry.type === "Directory") {
-        entry.mode = (entry.mode || entry.props.mode) | 0o500;
-        entry.props.mode = entry.mode;
+        entry.props.mode = addExecBitWhenReadBitPresent(entry.props.mode);
+      }
+
+      // In a similar way as for directories, but only if is in a path
+      // location that is expected to be executable (npm "bin" links)
+      if (entry.type === "File" && entry.path.indexOf(binPathMatch) > -1) {
+        entry.props.mode = addExecBitWhenReadBitPresent(entry.props.mode);
       }
 
       return true;
@@ -783,17 +975,12 @@ files.createTarGzStream = function (dirPath, options) {
 // Tar-gzips a directory into a tarball on disk, synchronously.
 // The tar archive will contain a top-level directory named after dirPath.
 files.createTarball = function (dirPath, tarball, options) {
-  var future = new Future;
   var out = files.createWriteStream(tarball);
-  out.on('error', function (err) {
-    future.throw(err);
-  });
-  out.on('close', function () {
-    future.return();
-  });
-
-  files.createTarGzStream(dirPath, options).pipe(out);
-  future.wait();
+  new Promise(function (resolve, reject) {
+    out.on('error', reject);
+    out.on('close', resolve);
+    files.createTarGzStream(dirPath, options).pipe(out);
+  }).await();
 };
 
 // Use this if you'd like to replace a directory with another
@@ -803,34 +990,72 @@ files.createTarball = function (dirPath, tarball, options) {
 // toDir does not exist" and "you can end up with garbage directories
 // sitting around", but not "there's any time where toDir exists but
 // is in a state other than initial or final".)
-files.renameDirAlmostAtomically = function (fromDir, toDir) {
-  var garbageDir = toDir + '-garbage-' + utils.randomToken();
+files.renameDirAlmostAtomically =
+  Profile("files.renameDirAlmostAtomically", (fromDir, toDir) => {
+    const garbageDir = `${toDir}-garbage-${utils.randomToken()}`;
 
-  // Get old dir out of the way, if it exists.
-  var movedOldDir = true;
-  try {
-    files.rename(toDir, garbageDir);
-  } catch (e) {
-    if (e.code !== 'ENOENT')
-      throw e;
-    movedOldDir = false;
-  }
+    // Get old dir out of the way, if it exists.
+    let cleanupGarbage = false;
+    let forceCopy = false;
+    try {
+      files.rename(toDir, garbageDir);
+      cleanupGarbage = true;
+    } catch (e) {
+      if (e.code === 'EXDEV') {
+        // Some (notably Docker) file systems will fail to do a seemingly
+        // harmless operation, such as renaming, on what is apparently the same
+        // file system.  AUFS will do this even if the `fromDir` and `toDir`
+        // are on the same layer, and OverlayFS will fail if the `fromDir` and
+        // `toDir` are on different layers.  In these cases, we will not be
+        // atomic and will need to do a recursive copy.
+        forceCopy = true;
+      } else if (e.code !== 'ENOENT') {
+        // No such file or directory is okay, but anything else is not.
+        throw e;
+      }
+    }
 
-  // Now rename the directory.
-  files.rename(fromDir, toDir);
+    if (! forceCopy) {
+      try {
+        files.rename(fromDir, toDir);
+      } catch (e) {
+        // It's possible that there may not have been a `toDir` to have
+        // advanced warning about this, so we're prepared to handle it again.
+        if (e.code === 'EXDEV') {
+          forceCopy = true;
+        } else {
+          throw e;
+        }
+      }
+    }
 
-  // ... and delete the old one.
-  if (movedOldDir)
-    files.rm_recursive(garbageDir);
-};
+    // If we've been forced to jeopardize our atomicity due to file-system
+    // limitations, we'll resort to copying.
+    if (forceCopy) {
+      files.rm_recursive(toDir);
+      files.cp_r(fromDir, toDir);
+    }
 
-files.writeFileAtomically = function (filename, contents) {
-  var tmpFile = files.pathJoin(
-    files.pathDirname(filename),
-    '.' + files.pathBasename(filename) + '.' + utils.randomToken());
-  files.writeFile(tmpFile, contents);
-  files.rename(tmpFile, filename);
-};
+    // ... and take out the trash.
+    if (cleanupGarbage) {
+      // We don't care about how long this takes, so we'll let it go async.
+      files.rm_recursive(garbageDir);
+    }
+  });
+
+files.writeFileAtomically =
+  Profile("files.writeFileAtomically", function (filename, contents) {
+    const parentDir = files.pathDirname(filename);
+    files.mkdir_p(parentDir);
+
+    const tmpFile = files.pathJoin(
+      parentDir,
+      '.' + files.pathBasename(filename) + '.' + utils.randomToken()
+    );
+
+    files.writeFile(tmpFile, contents);
+    files.rename(tmpFile, filename);
+  });
 
 // Like fs.symlinkSync, but creates a temporay link and renames it over the
 // file; this means it works even if the file already exists.
@@ -865,130 +1090,136 @@ files.symlinkOverSync = function (linkText, file) {
 // underlying V8 issue is:
 //   https://code.google.com/p/v8/issues/detail?id=1281
 files.runJavaScript = function (code, options) {
-  if (typeof code !== 'string')
+  if (typeof code !== 'string') {
     throw new Error("code must be a string");
+  }
 
   options = options || {};
   var filename = options.filename || "<anonymous>";
-  var keys = [], values = [];
-  // don't assume that _.keys and _.values are guaranteed to
-  // enumerate in the same order
-  _.each(options.symbols, function (value, name) {
-    keys.push(name);
-    values.push(value);
-  });
 
-  var stackFilename = filename;
-  if (options.sourceMap) {
-    // We want to generate an arbitrary filename that we use to associate the
-    // file with its source map.
-    stackFilename = "<runJavaScript-" + nextStackFilenameCounter++ + ">";
-  }
+  return Profile.time('runJavaScript ' + filename, () => {
 
-  var chunks = [];
-  var header = "(function(" + keys.join(',') + "){";
-  chunks.push(header);
-  if (options.sourceMap) {
-    var consumer = new sourcemap.SourceMapConsumer(options.sourceMap);
-    chunks.push(sourcemap.SourceNode.fromStringWithSourceMap(
-      code, consumer));
-  } else {
-    chunks.push(code);
-  }
-  // \n is necessary in case final line is a //-comment
-  chunks.push("\n})");
-
-  var wrapped;
-  var parsedSourceMap = null;
-  if (options.sourceMap) {
-    var node = new sourcemap.SourceNode(null, null, null, chunks);
-    var results = node.toStringWithSourceMap({
-      file: stackFilename
+    var keys = [], values = [];
+    // don't assume that _.keys and _.values are guaranteed to
+    // enumerate in the same order
+    _.each(options.symbols, function (value, name) {
+      keys.push(name);
+      values.push(value);
     });
-    wrapped = results.code;
-    parsedSourceMap = results.map.toJSON();
-    if (options.sourceMapRoot) {
-      // Add the specified root to any root that may be in the file.
-      parsedSourceMap.sourceRoot = files.pathJoin(
-        options.sourceMapRoot, parsedSourceMap.sourceRoot || '');
-    }
-    // source-map-support doesn't ever look at the sourcesContent field, so
-    // there's no point in keeping it in memory.
-    delete parsedSourceMap.sourcesContent;
-    parsedSourceMaps[stackFilename] = parsedSourceMap;
-  } else {
-    wrapped = chunks.join('');
-  };
 
-  try {
-    // See #runInThisContext
-    //
-    // XXX it'd be nice to runInNewContext so that the code can't mess
-    // with our globals, but objects that come out of runInNewContext
-    // have bizarro antimatter prototype chains and break 'instanceof
-    // Array'. for now, steer clear
-    //
-    // Pass 'true' as third argument if we want the parse error on
-    // stderr (which we don't).
-    var script = require('vm').createScript(wrapped, stackFilename);
-  } catch (nodeParseError) {
-    if (!(nodeParseError instanceof SyntaxError))
-      throw nodeParseError;
-    // Got a parse error. Unfortunately, we can't actually get the
-    // location of the parse error from the SyntaxError; Node has some
-    // hacky support for displaying it over stderr if you pass an
-    // undocumented third argument to stackFilename, but that's not
-    // what we want. See
-    //    https://github.com/joyent/node/issues/3452
-    // for more information. One thing to try (and in fact, what an
-    // early version of this function did) is to actually fork a new
-    // node to run the code and parse its output. We instead run an
-    // entirely different JS parser, from the Babel project, but
-    // which at least has a nice API for reporting errors.
-    var parse = require('meteor-babel').parse;
+    var stackFilename = filename;
+    if (options.sourceMap) {
+      // We want to generate an arbitrary filename that we use to associate the
+      // file with its source map.
+      stackFilename = "<runJavaScript-" + nextStackFilenameCounter++ + ">";
+    }
+
+    var chunks = [];
+    var header = "(function(" + keys.join(',') + "){";
+    chunks.push(header);
+    if (options.sourceMap) {
+      var consumer = new sourcemap.SourceMapConsumer(options.sourceMap);
+      chunks.push(sourcemap.SourceNode.fromStringWithSourceMap(
+        code, consumer));
+    } else {
+      chunks.push(code);
+    }
+    // \n is necessary in case final line is a //-comment
+    chunks.push("\n})");
+
+    var wrapped;
+    var parsedSourceMap = null;
+    if (options.sourceMap) {
+      var node = new sourcemap.SourceNode(null, null, null, chunks);
+      var results = node.toStringWithSourceMap({
+        file: stackFilename
+      });
+      wrapped = results.code;
+      parsedSourceMap = results.map.toJSON();
+      if (options.sourceMapRoot) {
+        // Add the specified root to any root that may be in the file.
+        parsedSourceMap.sourceRoot = files.pathJoin(
+          options.sourceMapRoot, parsedSourceMap.sourceRoot || '');
+      }
+      // source-map-support doesn't ever look at the sourcesContent field, so
+      // there's no point in keeping it in memory.
+      delete parsedSourceMap.sourcesContent;
+      parsedSourceMaps[stackFilename] = parsedSourceMap;
+    } else {
+      wrapped = chunks.join('');
+    };
+
     try {
-      parse(wrapped, { strictMode: false });
-    } catch (parseError) {
-      if (typeof parseError.loc !== "object") {
-        throw parseError;
+      // See #runInThisContext
+      //
+      // XXX it'd be nice to runInNewContext so that the code can't mess
+      // with our globals, but objects that come out of runInNewContext
+      // have bizarro antimatter prototype chains and break 'instanceof
+      // Array'. for now, steer clear
+      //
+      // Pass 'true' as third argument if we want the parse error on
+      // stderr (which we don't).
+      var script = require('vm').createScript(wrapped, stackFilename);
+    } catch (nodeParseError) {
+      if (!(nodeParseError instanceof SyntaxError)) {
+        throw nodeParseError;
       }
-
-      var err = new files.FancySyntaxError;
-      err.message = parseError.message;
-
-      if (parsedSourceMap) {
-        // XXX this duplicates code in computeGlobalReferences
-        var consumer2 = new sourcemap.SourceMapConsumer(parsedSourceMap);
-        var original = consumer2.originalPositionFor(parseError.loc);
-        if (original.source) {
-          err.file = original.source;
-          err.line = original.line;
-          err.column = original.column;
-          throw err;
+      // Got a parse error. Unfortunately, we can't actually get the
+      // location of the parse error from the SyntaxError; Node has some
+      // hacky support for displaying it over stderr if you pass an
+      // undocumented third argument to stackFilename, but that's not
+      // what we want. See
+      //    https://github.com/joyent/node/issues/3452
+      // for more information. One thing to try (and in fact, what an
+      // early version of this function did) is to actually fork a new
+      // node to run the code and parse its output. We instead run an
+      // entirely different JS parser, from the Babel project, but
+      // which at least has a nice API for reporting errors.
+      var parse = require('meteor-babel').parse;
+      try {
+        parse(wrapped, { strictMode: false });
+      } catch (parseError) {
+        if (typeof parseError.loc !== "object") {
+          throw parseError;
         }
+
+        var err = new files.FancySyntaxError;
+        err.message = parseError.message;
+
+        if (parsedSourceMap) {
+          // XXX this duplicates code in computeGlobalReferences
+          var consumer2 = new sourcemap.SourceMapConsumer(parsedSourceMap);
+          var original = consumer2.originalPositionFor(parseError.loc);
+          if (original.source) {
+            err.file = original.source;
+            err.line = original.line;
+            err.column = original.column;
+            throw err;
+          }
+        }
+
+        err.file = filename;  // *not* stackFilename
+        err.line = parseError.loc.line;
+        err.column = parseError.loc.column;
+
+        // adjust errors on line 1 to account for our header
+        if (err.line === 1) {
+          err.column -= header.length;
+        }
+
+        throw err;
       }
 
-      err.file = filename;  // *not* stackFilename
-      err.line = parseError.loc.line;
-      err.column = parseError.loc.column;
-
-      // adjust errors on line 1 to account for our header
-      if (err.line === 1) {
-        err.column -= header.length;
-      }
-
-      throw err;
+      // What? Node thought that this was a parse error and Babel didn't?
+      // Eh, just throw Node's error and don't care too much about the line
+      // numbers being right.
+      throw nodeParseError;
     }
 
-    // What? Node thought that this was a parse error and Babel didn't?
-    // Eh, just throw Node's error and don't care too much about the line
-    // numbers being right.
-    throw nodeParseError;
-  }
+    var func = script.runInThisContext();
 
-  var func = script.runInThisContext();
-
-  return (buildmessage.markBoundary(func)).apply(null, values);
+    return (buildmessage.markBoundary(func)).apply(null, values);
+  });
 };
 
 // - message: an error message from the parser
@@ -1010,8 +1241,9 @@ files.readdirNoDots = function (path) {
   try {
     var entries = files.readdir(path);
   } catch (e) {
-    if (e.code === 'ENOENT')
+    if (e.code === 'ENOENT') {
       return [];
+    }
     throw e;
   }
   return _.filter(entries, function (entry) {
@@ -1029,8 +1261,9 @@ var getLines = function (file) {
   // strip blank lines at the end
   while (lines.length) {
     var line = lines[lines.length - 1];
-    if (line.match(/\S/))
+    if (line.match(/\S/)) {
       break;
+    }
     lines.pop();
   }
 
@@ -1048,8 +1281,9 @@ exports.getLinesOrEmpty = function (file) {
   try {
     return getLines(file);
   } catch (e) {
-    if (e && e.code === 'ENOENT')
+    if (e && e.code === 'ENOENT') {
       return [];
+    }
     throw e;
   }
 };
@@ -1060,8 +1294,9 @@ exports.readJSONOrNull = function (file) {
   try {
     var raw = files.readFile(file, 'utf8');
   } catch (e) {
-    if (e && e.code === 'ENOENT')
+    if (e && e.code === 'ENOENT') {
       return null;
+    }
     throw e;
   }
   return JSON.parse(raw);
@@ -1070,8 +1305,9 @@ exports.readJSONOrNull = function (file) {
 // Trims whitespace & other filler characters of a line in a project file.
 files.trimSpaceAndComments = function (line) {
   var match = line.match(/^([^#]*)#/);
-  if (match)
+  if (match) {
     line = match[1];
+  }
   return files.trimSpace(line);
 };
 
@@ -1142,7 +1378,9 @@ files.currentEnvWithPathsAdded = function (...paths) {
     pathPropertyName = _.find(Object.keys(env), (key) => {
       return key.toUpperCase() === 'PATH';
     });
-    if (!pathPropertyName) pathPropertyName = 'Path';
+    if (!pathPropertyName) {
+      pathPropertyName = 'Path';
+    }
   } else {
     pathPropertyName = 'PATH';
   }
@@ -1276,7 +1514,6 @@ files.readLinkToMeteorScript = function (linkLocation, platform) {
 //   A helpful file to import for this purpose is colon-converter.js, which also
 //   knows how to convert various configuration file formats.
 
-
 files.fsFixPath = {};
 /**
  * Wrap a function from node's fs module to use the right slashes for this OS
@@ -1310,47 +1547,89 @@ function wrapFsFunc(fsFuncName, pathArgIndices, options) {
         args[i] = files.convertToOSPath(args[i]);
       }
 
-      const canYield = Fiber.current && Fiber.yield && ! Fiber.yield.disallowed;
       const shouldBeSync = alwaysSync || sync;
+      // There's some overhead in awaiting a Promise of an async call,
+      // vs just doing the sync call, which for a call like "stat"
+      // takes longer than the call itself.  Different parts of the tool
+      // may perform 1,000s or 10,000s of stats each under certain
+      // conditions, so we get a nice performance boost from making
+      // these calls sync.
+      const isQuickie = (fsFuncName === 'stat' ||
+                         fsFuncName === 'rename' ||
+                         fsFuncName === 'symlink');
 
-      if (canYield && shouldBeSync) {
-        const fut = new Future;
+      const dirty = options && options.dirty;
+      const dirtyFn = typeof dirty === "function" ? dirty : null;
 
-        args.push(function callback(err, value) {
-          if (options.noErr) {
-            fut.return(err);
-          } else if (err) {
-            fut.throw(err);
-          } else {
-            fut.return(value);
-          }
+      if (canYield() &&
+          shouldBeSync &&
+          ! isQuickie) {
+        const promise = new Promise((resolve, reject) => {
+          args.push((err, value) => {
+            if (options.noErr) {
+              resolve(err);
+            } else if (err) {
+              reject(err);
+            } else {
+              resolve(value);
+            }
+          });
+
+          fsFunc.apply(fs, args);
         });
 
-        fsFunc.apply(fs, args);
+        const result = promise.await();
 
-        const result = fut.wait();
+        if (dirtyFn) {
+          dirtyFn(...args);
+        }
+
         return options.modifyReturnValue
           ? options.modifyReturnValue(result)
           : result;
+
       } else if (shouldBeSync) {
         // Should be sync but can't yield: we are not in a Fiber.
         // Run the sync version of the fs.* method.
         const result = fsFuncSync.apply(fs, args);
+
+        if (dirtyFn) {
+          dirtyFn(...args);
+        }
+
         return options.modifyReturnValue ?
                options.modifyReturnValue(result) : result;
+
       } else if (! sync) {
         // wrapping a plain async version
-        const cb = args[fsFunc.length - 1];
-        if (typeof cb === 'function') {
-          args[fsFunc.length - 1] = function (err, res) {
-            if (options.modifyReturnValue) {
-              res = options.modifyReturnValue(res);
-            }
-            Fiber(cb.bind(null, err, res)).run();
-          };
+        let cb = args[args.length - 1];
+        if (typeof cb === "function") {
+          args.pop();
+        } else {
+          cb = null;
         }
-        fsFunc.apply(fs, args);
-        return null;
+
+        new Promise((resolve, reject) => {
+          args.push((err, res) => {
+            err ? reject(err) : resolve(res);
+          });
+
+          fsFunc.apply(fs, args);
+
+        }).then(res => {
+          if (dirtyFn) {
+            dirtyFn(...args);
+          }
+
+          if (options.modifyReturnValue) {
+            res = options.modifyReturnValue(res);
+          }
+
+          cb && cb(null, res);
+
+        }, cb);
+
+        return;
       }
 
       throw new Error('unexpected');
@@ -1368,8 +1647,27 @@ function wrapFsFunc(fsFuncName, pathArgIndices, options) {
     Profile('wrapped.fs.' + fsFuncName + 'Sync', makeWrapper({ sync: true }));
 }
 
-wrapFsFunc("writeFile", [0]);
-wrapFsFunc("appendFile", [0]);
+let dependOnPathSalt = 0;
+export const dependOnPath = require("optimism").wrap(
+  // Always return something different to prevent optimism from
+  // second-guessing the dirtiness of this function.
+  path => ++dependOnPathSalt
+);
+
+function wrapDestructiveFsFunc(name, pathArgIndices) {
+  pathArgIndices = pathArgIndices || [0];
+  wrapFsFunc(name, pathArgIndices, {
+    dirty(...args) {
+      // Immediately reset all optimistic functions (defined in
+      // tools/fs/optimistic.js) that depend on these paths.
+      pathArgIndices.forEach(i => dependOnPath.dirty(args[i]));
+    }
+  });
+}
+
+wrapDestructiveFsFunc("writeFile");
+wrapDestructiveFsFunc("appendFile");
+
 wrapFsFunc("readFile", [0], {
   modifyReturnValue: function (fileData) {
     if (_.isString(fileData)) {
@@ -1379,12 +1677,84 @@ wrapFsFunc("readFile", [0], {
     return fileData;
   }
 });
+
 wrapFsFunc("stat", [0]);
 wrapFsFunc("lstat", [0]);
-wrapFsFunc("exists", [0], {noErr: true});
-wrapFsFunc("rename", [0, 1]);
 
-if (process.platform === "win32") {
+wrapDestructiveFsFunc("rename", [0, 1]);
+
+// After the outermost files.withCache call returns, the withCacheCache is
+// reset to null so that it does not survive server restarts.
+let withCacheCache = null;
+
+files.withCache = Profile("files.withCache", function (fn) {
+  const oldCache = withCacheCache;
+  withCacheCache = oldCache || Object.create(null);
+  try {
+    return fn();
+  } finally {
+    withCacheCache = oldCache;
+  }
+});
+
+function enableCache(name) {
+  const method = files[name];
+
+  function makeCacheKey(args) {
+    var parts = [name];
+
+    for (var i = 0; i < args.length; ++i) {
+      var arg = args[i];
+
+      if (typeof arg !== "string") {
+        // If any of the arguments is not a string, then we won't cache
+        // the result of the corresponding file.* method invocation.
+        return null;
+      }
+
+      parts.push(arg);
+    }
+
+    return parts.join("\0");
+  }
+
+  files[name] = function (...args) {
+    if (withCacheCache) {
+      var cacheKey = makeCacheKey(args);
+      if (cacheKey && cacheKey in withCacheCache) {
+        return withCacheCache[cacheKey];
+      }
+    }
+
+    const result = method.apply(files, args);
+
+    if (withCacheCache && cacheKey !== null) {
+      // If cacheKey === null, then we called makeCacheKey above and it
+      // failed because one of the arguments was not a string, so we
+      // should not try to call makeCacheKey again.
+      withCacheCache[cacheKey || makeCacheKey(args)] = result;
+    }
+
+    return result;
+  };
+}
+
+enableCache("readdir");
+enableCache("realpath");
+enableCache("stat");
+enableCache("lstat");
+
+// The fs.exists method is deprecated in Node v4:
+// https://nodejs.org/api/fs.html#fs_fs_exists_path_callback
+files.exists =
+files.existsSync = function (path, callback) {
+  if (typeof callback === "function") {
+    throw new Error("Passing a callback to files.exists is no longer supported");
+  }
+  return !! files.statOrNull(path);
+};
+
+if (files.isWindowsLikeFilesystem()) {
   var rename = files.rename;
 
   files.rename = function (from, to) {
@@ -1397,8 +1767,9 @@ if (process.platform === "win32") {
         rename(from, to);
         success = true;
       } catch (err) {
-        if (err.code !== 'EPERM')
+        if (err.code !== 'EPERM' && err.code !== 'EACCES') {
           throw err;
+        }
       }
     }
     if (! success) {
@@ -1419,10 +1790,11 @@ wrapFsFunc("readdir", [0], {
   }
 });
 
-wrapFsFunc("rmdir", [0]);
-wrapFsFunc("mkdir", [0]);
-wrapFsFunc("unlink", [0]);
-wrapFsFunc("chmod", [0]);
+wrapDestructiveFsFunc("rmdir");
+wrapDestructiveFsFunc("mkdir");
+wrapDestructiveFsFunc("unlink");
+wrapDestructiveFsFunc("chmod");
+
 wrapFsFunc("open", [0]);
 
 // XXX this doesn't give you the second argument to the callback
@@ -1453,17 +1825,6 @@ files.unwatchFile = function (...args) {
   return fs.unwatchFile(...args);
 };
 
-// wrap pathwatcher because it works with file system paths
-// XXX we don't currently convert the path argument passed to the watch
-//     callback, but we currently don't use the argument either
-files.pathwatcherWatch = function (...args) {
-  args[0] = files.convertToOSPath(args[0]);
-  // don't import pathwatcher until the moment we actually need it
-  // pathwatcher has a record of keeping some global state
-  var pathwatcher = require('pathwatcher');
-  return require("pathwatcher").watch(...args);
-};
-
 files.readBufferWithLengthAndOffset = function (filename, length, offset) {
   var data = new Buffer(length);
   // Read the data from disk, if it is non-empty. Avoid doing IO for empty
@@ -1478,8 +1839,9 @@ files.readBufferWithLengthAndOffset = function (filename, length, offset) {
     } finally {
       files.close(fd);
     }
-    if (count !== length)
+    if (count !== length) {
       throw new Error("couldn't read entire resource");
+    }
   }
   return data;
 };

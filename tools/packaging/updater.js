@@ -25,8 +25,9 @@ exports.tryToDownloadUpdate = function (options) {
   // Don't run more than one check simultaneously. It should be
   // harmless but having two downloads happening simultaneously (and
   // two sets of messages being printed) would be confusing.
-  if (checkInProgress)
+  if (checkInProgress) {
     return;
+  }
   checkInProgress = true;
   checkForUpdate(!! options.showBanner, !! options.printErrors);
   checkInProgress = false;
@@ -56,10 +57,9 @@ var checkForUpdate = function (showBanner, printErrors) {
     }
   }
 
-  if (!release.current.isProperRelease())
+  if (!release.current.isProperRelease()) {
     return;
-
-  updateMeteorToolSymlink(printErrors);
+  }
 
   maybeShowBanners();
 };
@@ -105,8 +105,9 @@ var maybeShowBanners = function () {
   // We now consider printing some simpler banners, if this isn't the latest
   // release. But if the user specified a release manually with --release, we
   // don't bother: we only want to tell users about ways to update *their app*.
-  if (release.forced)
+  if (release.forced) {
     return;
+  }
 
   const catalogUtils = require('./catalog/catalog-utils.js');
 
@@ -149,21 +150,24 @@ var maybeShowBanners = function () {
 
 // Update ~/.meteor/meteor to point to the tool binary from the tools of the
 // latest recommended release on the default release track.
-var updateMeteorToolSymlink = function (printErrors) {
+export function updateMeteorToolSymlink(printErrors) {
   // Get the latest release version of METEOR. (*Always* of the default
   // track, not of whatever we happen to be running: we always want the tool
   // symlink to go to the default track.)
   var latestReleaseVersion = catalog.official.getDefaultReleaseVersion();
   // Maybe you're on some random track with nothing recommended. That's OK.
-  if (!latestReleaseVersion)
+  if (!latestReleaseVersion) {
     return;
+  }
 
   var latestRelease = catalog.official.getReleaseVersion(
     latestReleaseVersion.track, latestReleaseVersion.version);
-  if (!latestRelease)
+  if (!latestRelease) {
     throw Error("latest release doesn't exist?");
-  if (!latestRelease.tool)
+  }
+  if (!latestRelease.tool) {
     throw Error("latest release doesn't have a tool?");
+  }
 
   var latestReleaseToolParts = latestRelease.tool.split('@');
   var latestReleaseToolPackage = latestReleaseToolParts[0];
@@ -202,10 +206,11 @@ var updateMeteorToolSymlink = function (printErrors) {
 
     // XXX maybe we shouldn't throw from this background thing
     // counter: this is super weird and should never ever happen.
-    if (!toolRecord)
+    if (!toolRecord) {
       throw Error("latest release has no tool?");
+    }
 
     tropohouse.default.linkToLatestMeteor(files.pathJoin(
       relativeToolPath, toolRecord.path, 'meteor'));
   }
-};
+}

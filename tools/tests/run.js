@@ -6,6 +6,7 @@ var Future = require('fibers/future');
 var _ = require('underscore');
 var files = require('../fs/files.js');
 var catalog = require('../packaging/catalog/catalog.js');
+var os = require('os');
 
 var DEFAULT_RELEASE_TRACK = catalog.DEFAULT_TRACK;
 
@@ -81,7 +82,7 @@ selftest.define("run", function () {
   run.match("restarted");
 
   // Crash just once, then restart successfully
-  s.write("crash.js", `
+  s.write("crash_then_restart.js", `
 var fs = Npm.require('fs');
 var path = Npm.require('path');
 var crashmark = path.join(process.env.METEOR_TEST_TMP, 'crashed');
@@ -96,7 +97,7 @@ try {
   run.waitSecs(5);
   run.match("restarted");
   run.stop();
-  s.unlink("crash.js");
+  s.unlink("crash_then_restart.js");
 
   run = s.run('--settings', 's.json');
   run.waitSecs(5);
@@ -106,7 +107,16 @@ try {
   run.match('s.json: parse error reading settings file');
   run.match('Waiting for file change');
   s.write('s.json', '{}');
+  run.waitSecs(15);
   run.match('App running at');
+  run.stop();
+
+  // Make sure a directory passed to --settings does not cause an infinite
+  // re-build loop (issue #3854).
+  run = s.run('--settings', os.tmpdir());
+  run.match(`${os.tmpdir()}: file not found (settings file)`);
+  run.match('Waiting for file change');
+  run.forbid('Modified -- restarting');
   run.stop();
 
   // How about a bundle failure right at startup
@@ -173,13 +183,14 @@ selftest.define("run --once", ["yet-unsolved-windows-failure"], function () {
   run.forbidAll("updated");
   s.unlink('empty.js');
   s.write('.meteor/release', originalRelease);
+});
 
-  // Try it with a real Mongo. Make sure that it actually starts one.
-  s = new Sandbox;
+selftest.define("run --once with real Mongo", function () {
+  var s = new Sandbox;
   s.createApp("onceapp", "once");
   s.cd("onceapp");
   s.set("RUN_ONCE_OUTCOME", "mongo");
-  run = s.run("--once");
+  var run = s.run("--once");
   run.waitSecs(30);
   run.expectExit(86);
 });
@@ -230,12 +241,14 @@ selftest.define("run errors", function () {
   f.wait();
 });
 
-selftest.define("update during run", ["checkout"], function () {
+selftest.define("update during run", ["checkout", 'custom-warehouse'], function () {
   var s = new Sandbox({
     warehouse: SIMPLE_WAREHOUSE,
     fakeMongo: true
   });
   var run;
+
+  s.set("METEOR_WATCH_PRIORITIZE_CHANGED", "false");
 
   s.createApp("myapp", "packageless", { release: DEFAULT_RELEASE_TRACK + '@v1' });
   s.cd("myapp");
@@ -247,6 +260,7 @@ selftest.define("update during run", ["checkout"], function () {
   run.match('localhost:3000');
   s.write('.meteor/release', DEFAULT_RELEASE_TRACK + '@v2');
   run.matchErr('to Meteor v2 from Meteor v1');
+  run.waitSecs(10);
   run.expectExit(254);
 
   // But not if the release was forced (case 1)
@@ -257,8 +271,9 @@ selftest.define("update during run", ["checkout"], function () {
   run.match('localhost:3000');
   s.write('.meteor/release', DEFAULT_RELEASE_TRACK + '@v2');
   s.write('empty.js', '');
-  run.waitSecs(2);
+  run.waitSecs(10);
   run.match('restarted');
+  run.waitSecs(10);
   run.stop();
   run.forbidAll("updated");
 
@@ -266,12 +281,13 @@ selftest.define("update during run", ["checkout"], function () {
   s.write('.meteor/release', DEFAULT_RELEASE_TRACK + '@v1');
   run = s.run("--release", DEFAULT_RELEASE_TRACK + "@v1");
   run.tellMongo(MONGO_LISTENING);
-  run.waitSecs(2);
+  run.waitSecs(10);
   run.match('localhost:3000');
   s.write('.meteor/release', DEFAULT_RELEASE_TRACK + '@v2');
   s.write('empty.js', '');
-  run.waitSecs(2);
+  run.waitSecs(10);
   run.match('restarted');
+  run.waitSecs(10);
   run.stop();
   run.forbidAll("updated");
 
@@ -283,12 +299,14 @@ selftest.define("update during run", ["checkout"], function () {
   s.write('.meteor/release', DEFAULT_RELEASE_TRACK + '@v1');
   run = s.run();
   run.tellMongo(MONGO_LISTENING);
-  run.waitSecs(2);
+  run.waitSecs(10);
   run.match('localhost:3000');
+  run.waitSecs(10);
   s.write('.meteor/release', DEFAULT_RELEASE_TRACK + '@v2');
   s.write('empty.js', '');
-  run.waitSecs(2);
+  run.waitSecs(10);
   run.match('restarted');
+  run.waitSecs(10);
   run.stop();
   run.forbidAll("updated");
 });
@@ -385,17 +403,17 @@ selftest.define("run and SIGKILL parent process", ["yet-unsolved-windows-failure
   // immediately.
   s.set("METEOR_BAD_PARENT_PID_FOR_TEST", "t");
   run = s.run();
-  run.waitSecs(30);
+  run.waitSecs(120);
   run.match("must be a valid process ID");
   run.match("Your application is crashing");
   run.stop();
 });
 
-selftest.define("'meteor run --port' requires a port", function () {
+selftest.define("'meteor run --port' accepts/rejects proper values", function () {
   var s = new Sandbox();
   var run;
 
-  s.createApp("myapp", "app-prints-pid");
+  s.createApp("myapp", "standard-app");
   s.cd("myapp");
 
   run = s.run("run", "--port", "example.com");
@@ -407,6 +425,16 @@ selftest.define("'meteor run --port' requires a port", function () {
   run.waitSecs(30);
   run.matchErr("--port must include a port");
   run.expectExit(1);
+
+  run = s.run("run", "--port", "3500");
+  run.waitSecs(30);
+  run.match('App running at: http://localhost:3500/');
+  run.stop();
+
+  run = s.run("run", "--port", "127.0.0.1:3500");
+  run.waitSecs(30);
+  run.match('App running at: http://127.0.0.1:3500/');
+  run.stop();
 });
 
 // Regression test for #3582.  Previously, meteor run would ignore changes to
@@ -444,4 +472,29 @@ selftest.define("update package during run", function () {
 
     runRun.stop();
   });
+});
+
+selftest.define("run logging in order", function () {
+  var s = new Sandbox({ fakeMongo: true });
+  var run;
+
+  // Starting a run
+  s.createApp("myapp", "standard-app");
+  s.cd("myapp");
+  s.write('packageless.js', `
+    Meteor.startup(function() {
+      for (var i = 0; i < 100000; i++) {
+        console.log('line: ' + i + '.');
+      }
+    });
+  `);
+  run = s.run();
+  run.match("myapp");
+  run.match("proxy");
+  run.tellMongo(MONGO_LISTENING);
+  run.match("MongoDB");
+  run.waitSecs(5);
+  for (var i = 0; i < 100000; i++) {
+    run.match(`line: ${i}.`);
+  }
 });

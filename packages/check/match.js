@@ -4,6 +4,7 @@
 //    - heterogenous arrays
 
 var currentArgumentChecker = new Meteor.EnvironmentVariable;
+var isPlainObject = require("./isPlainObject.js").isPlainObject;
 
 /**
  * @summary Check that a value matches a [pattern](#matchpatterns).
@@ -16,7 +17,7 @@ var currentArgumentChecker = new Meteor.EnvironmentVariable;
  * @param {MatchPattern} pattern The pattern to match
  * `value` against
  */
-check = function (value, pattern) {
+var check = exports.check = function (value, pattern) {
   // Record that check got called, if somebody cared.
   //
   // We use getOrNullIfOutsideFiber so that it's OK to call check()
@@ -43,9 +44,12 @@ check = function (value, pattern) {
  * @namespace Match
  * @summary The namespace for all Match types and methods.
  */
-Match = {
+var Match = exports.Match = {
   Optional: function (pattern) {
     return new Optional(pattern);
+  },
+  Maybe: function (pattern) {
+    return new Maybe(pattern);
   },
   OneOf: function (/*arguments*/) {
     return new OneOf(_.toArray(arguments));
@@ -112,6 +116,10 @@ var Optional = function (pattern) {
   this.pattern = pattern;
 };
 
+var Maybe = function (pattern) {
+  this.pattern = pattern;
+};
+
 var OneOf = function (choices) {
   if (_.isEmpty(choices))
     throw new Error("Must provide at least one choice to Match.OneOf");
@@ -130,12 +138,40 @@ var ObjectWithValues = function (pattern) {
   this.pattern = pattern;
 };
 
+var stringForErrorMessage = function (value, options) {
+  options = options || {};
+
+  if ( value === null ) return "null";
+
+  if ( options.onlyShowType ) {
+    return typeof value;
+  }
+
+  // Your average non-object things.  Saves from doing the try/catch below for.
+  if ( typeof value !== "object" ) {
+    return EJSON.stringify(value)
+  }
+
+  try {
+    // Find objects with circular references since EJSON doesn't support them yet (Issue #4778 + Unaccepted PR)
+    // If the native stringify is going to choke, EJSON.stringify is going to choke too.
+    JSON.stringify(value);
+  } catch (stringifyError) {
+    if ( stringifyError.name === "TypeError" ) {
+      return typeof value;
+    }
+  }
+
+  return EJSON.stringify(value);
+};
+
 var typeofChecks = [
   [String, "string"],
   [Number, "number"],
   [Boolean, "boolean"],
-  // While we don't allow undefined in EJSON, this is good for optional
+  // While we don't allow undefined/function in EJSON, this is good for optional
   // arguments with OneOf.
+  [Function, "function"],
   [undefined, "undefined"]
 ];
 
@@ -152,16 +188,18 @@ var testSubtree = function (value, pattern) {
       if (typeof value === typeofChecks[i][1])
         return false;
       return {
-        message: "Expected " + typeofChecks[i][1] + ", got " + typeof value,
+        message: "Expected " + typeofChecks[i][1] + ", got " + stringForErrorMessage(value, { onlyShowType: true }),
         path: ""
       };
     }
   }
+
   if (pattern === null) {
-    if (value === null)
+    if (value === null) {
       return false;
+    }
     return {
-      message: "Expected null, got " + EJSON.stringify(value),
+      message: "Expected null, got " + stringForErrorMessage(value),
       path: ""
     };
   }
@@ -171,7 +209,7 @@ var testSubtree = function (value, pattern) {
     if (value === pattern)
       return false;
     return {
-      message: "Expected " + pattern + ", got " + EJSON.stringify(value),
+      message: "Expected " + pattern + ", got " + stringForErrorMessage(value),
       path: ""
     };
   }
@@ -187,7 +225,7 @@ var testSubtree = function (value, pattern) {
     if (typeof value === "number" && (value | 0) === value)
       return false;
     return {
-      message: "Expected Integer, got " + (value instanceof Object ? EJSON.stringify(value) : value),
+      message: "Expected Integer, got " + stringForErrorMessage(value),
       path: ""
     };
   }
@@ -200,13 +238,13 @@ var testSubtree = function (value, pattern) {
   if (pattern instanceof Array) {
     if (pattern.length !== 1) {
       return {
-        message: "Bad pattern: arrays must have one type element" + EJSON.stringify(pattern),
+        message: "Bad pattern: arrays must have one type element" + stringForErrorMessage(pattern),
         path: ""
       };
     }
     if (!_.isArray(value) && !_.isArguments(value)) {
       return {
-        message: "Expected array, got " + EJSON.stringify(value),
+        message: "Expected array, got " + stringForErrorMessage(value),
         path: ""
       };
     }
@@ -235,7 +273,7 @@ var testSubtree = function (value, pattern) {
         path: err.path
       };
     }
-    if (pattern.condition(value))
+    if (result)
       return false;
     // XXX this error is terrible
     return {
@@ -245,8 +283,12 @@ var testSubtree = function (value, pattern) {
   }
 
 
-  if (pattern instanceof Optional)
+  if (pattern instanceof Maybe) {
+    pattern = Match.OneOf(undefined, null, pattern.pattern);
+  }
+  else if (pattern instanceof Optional) {
     pattern = Match.OneOf(undefined, pattern.pattern);
+  }
 
   if (pattern instanceof OneOf) {
     for (var i = 0; i < pattern.choices.length; ++i) {
@@ -259,7 +301,7 @@ var testSubtree = function (value, pattern) {
     }
     // XXX this error is terrible
     return {
-      message: "Failed Match.OneOf or Match.Optional validation",
+      message: "Failed Match.OneOf, Match.Maybe or Match.Optional validation",
       path: ""
     };
   }
@@ -309,7 +351,7 @@ var testSubtree = function (value, pattern) {
       path: ""
     };
   }
-  if (value.constructor !== Object) {
+  if (! isPlainObject(value)) {
     return {
       message: "Expected plain object",
       path: ""
@@ -319,13 +361,22 @@ var testSubtree = function (value, pattern) {
   var requiredPatterns = {};
   var optionalPatterns = {};
   _.each(pattern, function (subPattern, key) {
-    if (subPattern instanceof Optional)
+    if (subPattern instanceof Optional || subPattern instanceof Maybe)
       optionalPatterns[key] = subPattern.pattern;
     else
       requiredPatterns[key] = subPattern;
   });
 
-  for (var keys = _.keys(value), i = 0, length = keys.length; i < length; i++) {
+  //XXX: replace with underscore's _.allKeys if Meteor updates underscore to 1.8+ (or lodash)
+  var allKeys = function(obj){
+    var keys = [];
+    if (_.isObject(obj)){
+      for (var key in obj) keys.push(key);
+    }
+    return keys;
+  }
+
+  for (var keys = allKeys(value), i = 0, length = keys.length; i < length; i++) {
     var key = keys[i];
     var subValue = value[key];
     if (_.has(requiredPatterns, key)) {

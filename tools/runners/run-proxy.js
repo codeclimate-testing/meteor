@@ -1,5 +1,4 @@
 var _ = require('underscore');
-var Future = require('fibers/future');
 var runLog = require('./run-log.js');
 
 // options: listenPort, proxyToPort, proxyToHost, onFailure
@@ -28,8 +27,9 @@ _.extend(Proxy.prototype, {
   start: function () {
     var self = this;
 
-    if (self.server)
+    if (self.server) {
       throw new Error("already running?");
+    }
 
     self.started = false;
 
@@ -56,7 +56,11 @@ _.extend(Proxy.prototype, {
       self._tryHandleConnections();
     });
 
-    var fut = new Future;
+    var allowStart;
+    var promise = new Promise(function (resolve) {
+      allowStart = resolve;
+    });
+
     self.server.on('error', function (err) {
       if (err.code === 'EADDRINUSE') {
         var port = self.listenPort;
@@ -79,8 +83,7 @@ _.extend(Proxy.prototype, {
         runLog.log('' + err);
       }
       self.onFailure();
-      // Allow start() to return.
-      fut.isResolved() || fut['return']();
+      allowStart();
     });
 
     // Don't crash if the app doesn't respond. instead return an error
@@ -117,18 +120,19 @@ _.extend(Proxy.prototype, {
         // necessary.
         server.close();
       }
-      fut.isResolved() || fut['return']();
+      allowStart();
     });
 
-    fut.wait();
+    promise.await();
   },
 
   // Idempotent.
   stop: function () {
     var self = this;
 
-    if (! self.server)
+    if (! self.server) {
       return;
+    }
 
     if (! self.started) {
       // This probably means that we failed to listen. However, there could be a
@@ -166,28 +170,43 @@ _.extend(Proxy.prototype, {
   _tryHandleConnections: function () {
     var self = this;
 
+    function attempt(resOrSocket, fn) {
+      try {
+        return fn();
+      } catch (e) {
+        if (typeof resOrSocket.writeHead === "function") {
+          resOrSocket.writeHead(400, {
+            'Content-Type': 'text/plain'
+          });
+        }
+        resOrSocket.end("Bad request\n");
+      }
+    }
+
     while (self.httpQueue.length) {
-      if (self.mode !== "errorpage" && self.mode !== "proxy")
+      if (self.mode !== "errorpage" && self.mode !== "proxy") {
         break;
+      }
 
       var c = self.httpQueue.shift();
       if (self.mode === "errorpage") {
         showErrorPage(c.res);
       } else {
-        self.proxy.web(c.req, c.res, {
+        attempt(c.res, () => self.proxy.web(c.req, c.res, {
           target: 'http://' + self.proxyToHost + ':' + self.proxyToPort
-        });
+        }));
       }
     }
 
     while (self.websocketQueue.length) {
-      if (self.mode !== "proxy")
+      if (self.mode !== "proxy") {
         break;
+      }
 
       var c = self.websocketQueue.shift();
-      self.proxy.ws(c.req, c.socket, c.head, {
+      attempt(c.socket, () => self.proxy.ws(c.req, c.socket, c.head, {
         target: 'http://' + self.proxyToHost + ':' + self.proxyToPort
-      });
+      }));
     }
   },
 

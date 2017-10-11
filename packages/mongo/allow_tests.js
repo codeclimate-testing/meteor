@@ -13,7 +13,7 @@ if (Meteor.isServer) {
     check(nonce, String);
     check(idGeneration, String);
     var cursors = [];
-    var needToConfigure = undefined;
+    var needToConfigure;
 
     // helper for defining a collection. we are careful to create just one
     // Mongo.Collection even if the sub body is rerun, by caching them.
@@ -818,6 +818,28 @@ if (Meteor.isServer) {
     _.each(['insert', 'update', 'remove', 'fetch'], function (key) {
       var options = {};
       options[key] = true;
+      test.throws(function () {
+        collection.allow(options);
+      });
+      test.throws(function () {
+        collection.deny(options);
+      });
+    });
+
+    _.each(['insert', 'update', 'remove'], function (key) {
+      var options = {};
+      options[key] = false;
+      test.throws(function () {
+        collection.allow(options);
+      });
+      test.throws(function () {
+        collection.deny(options);
+      });
+    });
+
+    _.each(['insert', 'update', 'remove'], function (key) {
+      var options = {};
+      options[key] = undefined;
       test.throws(function () {
         collection.allow(options);
       });

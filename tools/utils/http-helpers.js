@@ -6,14 +6,46 @@ var os = require('os');
 var util = require('util');
 
 var _ = require('underscore');
-var Future = require('fibers/future');
 
 var files = require('../fs/files.js');
 var auth = require('../meteor-services/auth.js');
 var config = require('../meteor-services/config.js');
 var release = require('../packaging/release.js');
 var Console = require('../console/console.js').Console;
+var timeoutScaleFactor = require('./utils.js').timeoutScaleFactor;
 
+import { Writable } from "stream";
+
+class ConcatStream extends Writable {
+  constructor() {
+    super();
+    this.chunks = [];
+    this.size = 0;
+  }
+
+  _write(chunk, encoding, next) {
+    this.chunks.push(chunk);
+    this.size += chunk.length;
+    next();
+  }
+
+  getBuffer() {
+    if (this.chunks.length !== 1) {
+      this.chunks[0] = Buffer.concat(this.chunks);
+      this.chunks.length = 1;
+    }
+
+    return this.chunks[0];
+  }
+
+  end(force = false) {
+    // Override the Writable#end method to ignore any .end() calls for
+    // this stream, since we likely want to resume the download later.
+    if (force === true) {
+      super.end();
+    }
+  }
+}
 
 // Helper that tracks bytes written to a writable
 var WritableWithProgress = function (writable, listener) {
@@ -64,15 +96,16 @@ _.extend(WritableWithProgress.prototype, {
 var getUserAgent = function () {
   var version;
 
-  if (release.current)
+  if (release.current) {
     version = release.current.isCheckout() ? 'checkout' : release.current.name;
-  else
+  } else {
     // This happens when we haven't finished starting up yet (say, the
     // user passed --release 1.2.3 and we have to download 1.2.3
     // before we can get going), or if we are using an installed copy
     // of Meteor to 'meteor update'ing a project that was created by a
     // checkout and doesn't have a version yet.
     version = files.inCheckout() ? 'checkout' : files.getToolsVersion();
+  }
 
   return util.format('Meteor/%s OS/%s (%s; %s; %s;)', version,
                      os.platform(), os.type(), os.release(), os.arch());
@@ -115,16 +148,26 @@ _.extend(exports, {
   //   set to false since it doesn't understand origins (see comment
   //   in implementation).
   //
+  // - An optional options.onRequest callback may be provided if the
+  //   caller desires access to the request object.
+  //
   // NB: With useSessionHeader and useAuthHeader, this function will
   // read *and possibly write to* the session file, so if you are
   // writing auth code (in auth.js) and you call it, be sure to reread
   // the session file afterwards.
   request: function (urlOrOptions, callback) {
     var options;
-    if (!_.isObject(urlOrOptions))
+    if (!_.isObject(urlOrOptions)) {
       options = { url: urlOrOptions };
-    else
+    } else {
       options = _.clone(urlOrOptions);
+    }
+
+    var outputStream;
+    if (_.has(options, 'outputStream')) {
+      outputStream = options.outputStream;
+      delete options.outputStream;
+    }
 
     var bodyStream;
     if (_.has(options, 'bodyStream')) {
@@ -134,7 +177,7 @@ _.extend(exports, {
 
     // Body stream length for progress
     var bodyStreamLength = 0;
-    if (_.has(options, 'bodyStream')) {
+    if (_.has(options, 'bodyStreamLength')) {
       bodyStreamLength = options.bodyStreamLength;
       delete options.bodyStreamLength;
     } else {
@@ -169,6 +212,9 @@ _.extend(exports, {
 
     // This should never, ever be false, or else why are you using SSL?
     options.forceSSL = true;
+    if (process.env.CAFILE) {
+      options.ca = files.readFile(process.env.CAFILE);
+    }
 
     // followRedirect is very dangerous because request does not
     // appear to segregate cookies by origin, so any cookies (and
@@ -184,44 +230,49 @@ _.extend(exports, {
     delete options.useAuthHeader;
     if (useSessionHeader || useAuthHeader) {
       var sessionHeader = auth.getSessionId(config.getAccountsDomain());
-      if (sessionHeader)
+      if (sessionHeader) {
         options.headers['X-Meteor-Session'] = sessionHeader;
-      if (callback)
+      }
+      if (callback) {
         throw new Error("session header can't be used with callback");
+      }
     }
     if (useAuthHeader) {
       var authHeader = auth.getSessionToken(config.getAccountsDomain());
-      if (authHeader)
+      if (authHeader) {
         options.headers['X-Meteor-Auth'] = authHeader;
+      }
     }
 
-    var fut;
+    var promise;
     if (! callback) {
-      fut = new Future();
-      callback = function (err, response, body) {
-        if (err) {
-          fut['throw'](err);
-          return;
-        }
+      promise = new Promise(function (resolve, reject) {
+        callback = function (err, response, body) {
+          if (err) {
+            reject(err);
+            return;
+          }
 
-        var setCookie = {};
-        _.each(response.headers["set-cookie"] || [], function (h) {
-          var match = h.match(/^([^=\s]+)=([^;\s]+)/);
-          if (match)
-            setCookie[match[1]] = match[2];
-        });
+          var setCookie = {};
+          _.each(response.headers["set-cookie"] || [], function (h) {
+            var match = h.match(/^([^=\s]+)=([^;\s]+)/);
+            if (match) {
+              setCookie[match[1]] = match[2];
+            }
+          });
 
-        if (useSessionHeader && _.has(response.headers, "x-meteor-session")) {
-          auth.setSessionId(config.getAccountsDomain(),
-                            response.headers['x-meteor-session']);
-        }
+          if (useSessionHeader && _.has(response.headers, "x-meteor-session")) {
+            auth.setSessionId(config.getAccountsDomain(),
+                              response.headers['x-meteor-session']);
+          }
 
-        fut['return']({
-          response: response,
-          body: body,
-          setCookie: setCookie
-        });
-      };
+          resolve({
+            response: response,
+            body: body,
+            setCookie: setCookie
+          });
+        };
+      });
     }
 
     // try to get proxy from environment.
@@ -235,12 +286,49 @@ _.extend(exports, {
       options.proxy = proxy;
     }
 
+    if (! _.has(options, "timeout")) {
+      // 60 seconds for timeout between initial response headers and data,
+      // and between chunks of data while reading the rest of the response.
+      options.timeout = 60 * 1000 * timeoutScaleFactor;
+    } else if (! (typeof options.timeout === "number" &&
+                  options.timeout > 0)) {
+      // The timeout can be disabled by passing anything other than a
+      // positive number, e.g. { timeout: null }.
+      delete options.timeout;
+    }
+
+    let onRequest;
+    if (_.has(options, "onRequest")) {
+      onRequest = options.onRequest;
+      delete options.onRequest;
+    }
+
     // request is the most heavy-weight of the tool's npm dependencies; don't
     // require it until we definitely need it.
     Console.debug("Doing HTTP request: ", options.method || 'GET', options.url);
     var request = require('request');
-    var req = request(options, callback);
+    var req = request(options, function (error, response, body) {
+      if (! error &&
+          response &&
+          (typeof body === "string" ||
+           Buffer.isBuffer(body))) {
+        const contentLength = Number(response.headers["content-length"]);
+        const actualLength = Buffer.byteLength(body);
 
+        if (contentLength > 0 &&
+            actualLength < contentLength) {
+          error = new Error(
+            "Expected " + contentLength + " bytes in request body " +
+              "but received only " + actualLength);
+        }
+      }
+
+      return callback.call(this, error, response, body);
+    });
+
+    if (_.isFunction(onRequest)) {
+      onRequest(req);
+    }
 
     var totalProgress = { current: 0, end: bodyStreamLength + responseLength, done: false };
 
@@ -257,6 +345,10 @@ _.extend(exports, {
       bodyStream.pipe(dest);
     }
 
+    if (outputStream) {
+      req.pipe(outputStream);
+    }
+
     if (progress) {
       httpHelpers._addProgressEvents(req);
       req.on('progress', function (state) {
@@ -270,9 +362,9 @@ _.extend(exports, {
       });
     }
 
-    if (fut) {
+    if (promise) {
       try {
-        return fut.wait();
+        return promise.await();
       } finally {
         if (progress) {
           progress.reportProgressDone();
@@ -286,7 +378,7 @@ _.extend(exports, {
   // Adds progress callbacks to a request
   // Based on request-progress
   _addProgressEvents: function (request) {
-    var state;
+    var state = {};
 
     var emitProgress = function () {
       request.emit('progress', state);
@@ -294,7 +386,6 @@ _.extend(exports, {
 
     request
       .on('response', function (response) {
-        state = {};
         state.end = undefined;
         state.done = false;
         state.current = 0;
@@ -337,6 +428,83 @@ _.extend(exports, {
     } else {
       return body;
     }
-  }
+  },
 
+  // More or less as above, except with support for multiple attempts per
+  // request and resuming on retries. This means if the connection is bad,
+  // we can sometimes complete a request, even if each individual attempt fails.
+  // We only use this for package downloads. In theory we could use it for
+  // all requests but that seems like overkill and it isn't well tested in
+  // other scenarioes.
+  getUrlWithResuming(urlOrOptions) {
+    const options = _.isObject(urlOrOptions) ? _.clone(urlOrOptions) : {
+      url: urlOrOptions,
+    };
+
+    const maxAttempts =
+      _.has(options, "maxAttempts")
+      ? options.maxAttempts : 10;
+
+    const retryDelaySecs =
+      _.has(options, "retryDelaySecs")
+      ? options.retryDelaySecs : 5;
+
+    const masterProgress = options.progress;
+    const outputStream = new ConcatStream();
+
+    function attempt(triesRemaining = maxAttempts, startAt = 0) {
+      if (startAt > 0) {
+        options.headers = {
+          ...options.headers,
+          Range: `bytes=${startAt}-`
+        };
+      }
+
+      if (masterProgress &&
+          masterProgress.addChildTask) {
+        options.progress = masterProgress.addChildTask({
+          title: masterProgress._title
+        });
+      }
+
+      try {
+        return Promise.resolve(httpHelpers.request({
+          outputStream,
+          ...options,
+        }));
+
+      } catch (e) {
+        const size = outputStream.size;
+        const useTry = size === startAt;
+        const change = size - startAt;
+
+        if (!useTry || triesRemaining > 0) {
+          if (useTry) {
+            Console.debug(`Request failed, ${triesRemaining - 1} attempts left`);
+          } else {
+            Console.debug(`Request failed after ${change} bytes, retrying`);
+          }
+
+          return new Promise(
+            resolve => setTimeout(resolve, retryDelaySecs * 1000)
+          ).then(() => attempt(triesRemaining - (useTry ? 1 : 0), size));
+        }
+
+        Console.debug(`Request failed ${maxAttempts} times: failing`);
+        return Promise.reject(new files.OfflineError(e));
+      }
+    }
+
+    const result = attempt().await();
+    const response = result.response
+    if (response.statusCode >= 400 && response.statusCode < 600) {
+      const href = response.request.href;
+      throw Error(`Could not get ${href}; server returned [${response.statusCode}]`);
+    }
+
+    // Really end the stream if we got this far.
+    outputStream.end(true);
+
+    return outputStream.getBuffer();
+  }
 });

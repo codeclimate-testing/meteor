@@ -1,5 +1,6 @@
 const stylus = Npm.require('stylus');
 const nib = Npm.require('nib');
+const autoprefixer = Npm.require('autoprefixer-stylus');
 const Future = Npm.require('fibers/future');
 const fs = Plugin.fs;
 const path = Plugin.path;
@@ -19,7 +20,10 @@ class StylusCompiler extends MultiFileCachingCompiler {
   }
 
   getCacheKey(inputFile) {
-    return inputFile.getSourceHash();
+    return [
+      inputFile.getSourceHash(),
+      inputFile.getFileOptions(),
+    ];
   }
 
   compileResultSize(compileResult) {
@@ -27,10 +31,10 @@ class StylusCompiler extends MultiFileCachingCompiler {
       this.sourceMapSize(compileResult.sourceMap);
   }
 
-  // The heuristic is that a file is an import (ie, is not itself processed as a
-  // root) if it is in a subdirectory named 'imports' or if it matches
-  // *.import.styl. This can be overridden in either direction via an explicit
-  // `isImport` file option in api.addFiles.
+  // The heuristic is that a file is an import (ie, is not itself
+  // processed as a root) if it matches *.import.styl.  This can be
+  // overridden in either direction via an explicit `isImport` file option
+  // in api.addFiles.
   isRoot(inputFile) {
     const fileOptions = inputFile.getFileOptions();
     if (fileOptions.hasOwnProperty('isImport')) {
@@ -38,8 +42,7 @@ class StylusCompiler extends MultiFileCachingCompiler {
     }
 
     const pathInPackage = inputFile.getPathInPackage();
-    return !(/\.import\.styl$/.test(pathInPackage) ||
-             /(?:^|\/)imports\//.test(pathInPackage));
+    return ! /\.import\.styl$/.test(pathInPackage);
   }
 
   compileOneFile(inputFile, allFiles) {
@@ -94,8 +97,9 @@ class StylusCompiler extends MultiFileCachingCompiler {
           // if it is not a custom syntax path, it could be a lookup in a folder
           for (let i = paths.length - 1; i >= 0; i--) {
             const joined = path.join(paths[i], importPath);
-            if (fs.exists(joined))
+            if (statOrNull(joined)) {
               return [joined];
+            }
           }
         }
 
@@ -147,14 +151,20 @@ class StylusCompiler extends MultiFileCachingCompiler {
       return sourcemap;
     }
 
+    const fileOptions = inputFile.getFileOptions();
+
     const f = new Future;
 
-    const style = stylus(inputFile.getContentsAsString())
-            .use(nib())
-            .set('filename', inputFile.getPathInPackage())
-            .set('sourcemap', { inline: false, comment: false })
-            .set('cache', false)
-            .set('importer', importer);
+    let style = stylus(inputFile.getContentsAsString()).use(nib())
+
+    if (fileOptions.autoprefixer) {
+      style = style.use(autoprefixer(fileOptions.autoprefixer))
+    }
+
+    style = style.set('filename', inputFile.getPathInPackage())
+                 .set('sourcemap', { inline: false, comment: false })
+                 .set('cache', false)
+                 .set('importer', importer);
 
     style.render(f.resolver());
     let css;
@@ -176,5 +186,13 @@ class StylusCompiler extends MultiFileCachingCompiler {
       data: css,
       sourceMap: sourceMap
     });
+  }
+}
+
+function statOrNull(path) {
+  try {
+    return fs.statSync(path);
+  } catch (e) {
+    return null;
   }
 }

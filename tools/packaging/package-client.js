@@ -1,4 +1,3 @@
-var Future = require('fibers/future');
 var _ = require('underscore');
 
 var config = require('../meteor-services/config.js');
@@ -12,6 +11,9 @@ var authClient = require('../meteor-services/auth-client.js');
 var catalog = require('./catalog/catalog.js');
 var projectContextModule = require('../project-context.js');
 var colonConverter = require('../utils/colon-converter.js');
+var Profile = require('../tool-env/profile.js').Profile;
+
+import { requestGarbageCollection } from "../utils/gc.js";
 
 // Opens a DDP connection to a package server. Loads the packages needed for a
 // DDP connection, then calls DDP connect to the package server URL in config,
@@ -131,8 +133,9 @@ exports.updateServerPackageData = function (dataStore, options) {
 var _updateServerPackageData = function (dataStore, options) {
   var self = this;
   options = options || {};
-  if (dataStore === null)
+  if (dataStore === null) {
     throw Error("Data store expected");
+  }
 
   var done = false;
   var ret = {resetData: false};
@@ -188,9 +191,11 @@ var _updateServerPackageData = function (dataStore, options) {
       var zlib = require('zlib');
       var colsGzippedBuffer = new Buffer(
         remoteData.collectionsCompressed, 'base64');
-      var fut = new Future;
-      zlib.gunzip(colsGzippedBuffer, fut.resolver());
-      var colsJSON = fut.wait();
+      var colsJSON = new Promise((resolve, reject) => {
+        zlib.gunzip(colsGzippedBuffer, (err, res) => {
+          err ? reject(err) : resolve(res);
+        });
+      }).await();
       remoteData.collections = JSON.parse(colsJSON);
       delete remoteData.collectionsCompressed;
     }
@@ -216,6 +221,7 @@ var _updateServerPackageData = function (dataStore, options) {
   try {
     while (!done) {
       getSomeData();
+      requestGarbageCollection();
     }
   } finally {
     conn.close();
@@ -223,6 +229,9 @@ var _updateServerPackageData = function (dataStore, options) {
 
   return ret;
 };
+
+_updateServerPackageData = Profile('package-client _updateServerPackageData',
+                                   _updateServerPackageData);
 
 // Returns a logged-in DDP connection to the package server, or null if
 // we cannot log in. If an error unrelated to login occurs
@@ -264,8 +273,11 @@ var bundleSource = function (isopack, includeSources, packageDir) {
   // directory structure that we want (<package name>-<version-source/
   // at the top level).
   _.each(includeSources, function (f) {
-    files.copyFile(files.pathJoin(packageDir, f),
-                   files.pathJoin(sourcePackageDir, f));
+    const from = files.pathJoin(packageDir, f);
+    const to = files.pathJoin(sourcePackageDir, f);
+    if (files.exists(from)) {
+      files.copyFile(from, to);
+    }
   });
 
   // Write a package map to `.versions` inside the source tarball.  Note that
@@ -277,11 +289,13 @@ var bundleSource = function (isopack, includeSources, packageDir) {
   //      from inside an app, whereas the package-source-tree .versions file
   //      is only used for standalone packages
   var packageMapFilename = files.pathJoin(sourcePackageDir, '.versions');
-  if (files.exists(packageMapFilename))
+  if (files.exists(packageMapFilename)) {
     throw Error(".versions file already exists? " + packageMapFilename);
+  }
   var pluginProviderPackageMap = isopack.pluginProviderPackageMap;
-  if (! pluginProviderPackageMap)
+  if (! pluginProviderPackageMap) {
     throw Error("no pluginProviderPackageMap on isopack?");
+  }
   var packageMapFile = new projectContextModule.PackageMapFile({
     filename: packageMapFilename
   });
@@ -336,7 +350,7 @@ var uploadFile = function (putUrl, filepath) {
 
 exports.uploadFile = uploadFile;
 
-var bundleBuild = function (isopack) {
+export function bundleBuild(isopack, isopackCache) {
   buildmessage.assertInJob();
 
   var tempDir = files.mkdtemp('bp-');
@@ -350,7 +364,8 @@ var bundleBuild = function (isopack) {
   isopack.saveToPath(tarInputDir, {
     // When publishing packages that don't use new registerCompiler plugins,
     // make sure that old Meteors can use it too
-    includePreCompilerPluginIsopackVersions: true
+    includePreCompilerPluginIsopackVersions: true,
+    isopackCache,
   });
 
   var buildTarball = files.pathJoin(tempDir, packageTarName + '.tgz');
@@ -376,11 +391,9 @@ var bundleBuild = function (isopack) {
     tarballHash: tarballHash,
     treeHash: treeHash
   };
-};
+}
 
-exports.bundleBuild = bundleBuild;
-
-var createBuiltPackage = function (conn, isopack) {
+function createBuiltPackage(isopack, isopackCache) {
   buildmessage.assertInJob();
   var name = isopack.name;
 
@@ -388,13 +401,14 @@ var createBuiltPackage = function (conn, isopack) {
   // we get from createPackageBuild will expire!
   var bundleResult;
   buildmessage.enterJob("bundling build for " + name, function () {
-    bundleResult = bundleBuild(isopack);
+    bundleResult = bundleBuild(isopack, isopackCache);
   });
-  if (buildmessage.jobHasMessages())
+  if (buildmessage.jobHasMessages()) {
     return;
+  }
 
   return bundleResult;
-};
+}
 
 var publishBuiltPackage = function (conn, isopack, bundleResult) {
   buildmessage.assertInJob();
@@ -408,15 +422,17 @@ var publishBuiltPackage = function (conn, isopack, bundleResult) {
       buildArchitectures: isopack.buildArchitectures()
     });
   });
-  if (buildmessage.jobHasMessages())
+  if (buildmessage.jobHasMessages()) {
     return;
+  }
 
   buildmessage.enterJob("uploading build", function () {
     uploadFile(uploadInfo.uploadUrl,
                bundleResult.buildTarball);
   });
-  if (buildmessage.jobHasMessages())
+  if (buildmessage.jobHasMessages()) {
     return;
+  }
 
   buildmessage.enterJob('publishing package build for ' + name, function () {
     callPackageServerBM(conn, 'publishPackageBuild',
@@ -424,15 +440,18 @@ var publishBuiltPackage = function (conn, isopack, bundleResult) {
                         bundleResult.tarballHash,
                         bundleResult.treeHash);
   });
-  if (buildmessage.jobHasMessages())
+  if (buildmessage.jobHasMessages()) {
     return;
+  }
 };
 
-var createAndPublishBuiltPackage = function (conn, isopack) {
-  publishBuiltPackage(conn, isopack, createBuiltPackage(conn, isopack));
-};
-
-exports.createAndPublishBuiltPackage = createAndPublishBuiltPackage;
+export function createAndPublishBuiltPackage(conn, isopack, isopackCache) {
+  publishBuiltPackage(
+    conn,
+    isopack,
+    createBuiltPackage(isopack, isopackCache),
+  );
+}
 
 // Handle an error thrown on trying to connect to the package server.
 exports.handlePackageServerConnectionError = function (error) {
@@ -505,19 +524,27 @@ exports.updatePackageMetadata = function (options) {
     callPackageServerBM(
       conn, "changeVersionMetadata", versionIdentifier, dataToUpdate);
   });
-  if (buildmessage.jobHasMessages()) return;
+  if (buildmessage.jobHasMessages()) {
+    return;
+  }
 
   // Upload the new Readme.
   buildmessage.enterJob('uploading documentation', function () {
     var readmePath = saveReadmeToTmp(readmeInfo);
     var uploadInfo =
           callPackageServerBM(conn, "createReadme", versionIdentifier);
-    if (! uploadInfo) return;
-    if (! uploadFile(uploadInfo.url, readmePath)) return;
+    if (! uploadInfo) {
+      return;
+    }
+    if (! uploadFile(uploadInfo.url, readmePath)) {
+      return;
+    }
     callPackageServerBM(
       conn, "publishReadme", uploadInfo.uploadToken, { hash: readmeInfo.hash });
   });
-  if (buildmessage.jobHasMessages()) return;
+  if (buildmessage.jobHasMessages()) {
+    return;
+  }
 
 
 };
@@ -548,13 +575,15 @@ exports.publishPackage = function (options) {
   var name = packageSource.name;
   var version = packageSource.version;
 
-  if (options.new && options.existingVersion)
+  if (options.new && options.existingVersion) {
     throw Error("is it new or does it exist?!?");
+  }
 
   // Check that the package name is valid.
   utils.validatePackageName(name, { useBuildmessage: true });
-  if (buildmessage.jobHasMessages())
+  if (buildmessage.jobHasMessages()) {
     return;
+  }
 
   // Check that we have a version.
   if (! version) {
@@ -602,8 +631,9 @@ exports.publishPackage = function (options) {
     function () {
       return packageSource.processReadme();
   });
-  if (buildmessage.jobHasMessages())
+  if (buildmessage.jobHasMessages()) {
     return;
+  }
   if (readmeInfo && (readmeInfo.hash === files.blankHash)) {
     buildmessage.error(
       "Your documentation file is blank, so users may have trouble figuring " +
@@ -661,12 +691,14 @@ exports.publishPackage = function (options) {
       }
     }
   });
-  if (buildmessage.jobHasMessages())
+  if (buildmessage.jobHasMessages()) {
     return;
+  }
 
   var isopack = projectContext.isopackCache.getIsopack(name);
-  if (! isopack)
+  if (! isopack) {
     throw Error("no isopack " + name);
+  }
 
   // If we aren't able to include legacy builds in this version, make sure that
   // it has a fake dependency on isobuild:isopack-2 so that old versions of
@@ -684,20 +716,23 @@ exports.publishPackage = function (options) {
 
   var sourceFiles = isopack.getSourceFilesUnderSourceRoot(
     packageSource.sourceRoot);
-  if (! sourceFiles)
+  if (! sourceFiles) {
     throw Error("isopack doesn't know what its source files are?");
+  }
 
   // We need to have built the test package to get all of its sources, even
   // though we're not publishing a BUILD for the test package.
   if (packageSource.testName) {
     var testIsopack = projectContext.isopackCache.getIsopack(
       packageSource.testName);
-    if (! testIsopack)
+    if (! testIsopack) {
       throw Error("no testIsopack " + packageSource.testName);
+    }
     var testSourceFiles = testIsopack.getSourceFilesUnderSourceRoot(
       packageSource.sourceRoot);
-    if (! testSourceFiles)
+    if (! testSourceFiles) {
       throw Error("test isopack doesn't know what its source files are?");
+    }
     sourceFiles = _.union(sourceFiles, testSourceFiles);
   }
 
@@ -706,8 +741,9 @@ exports.publishPackage = function (options) {
     sourceBundleResult = bundleSource(
       isopack, sourceFiles, packageSource.sourceRoot);
   });
-  if (buildmessage.jobHasMessages())
+  if (buildmessage.jobHasMessages()) {
     return;
+  }
 
   // Create the package. Check that the metadata exists.
   if (options.new) {
@@ -716,8 +752,9 @@ exports.publishPackage = function (options) {
         name: packageSource.name
       });
     });
-    if (buildmessage.jobHasMessages())
+    if (buildmessage.jobHasMessages()) {
       return;
+    }
   }
 
   if (options.existingVersion) {
@@ -732,9 +769,12 @@ exports.publishPackage = function (options) {
     }
 
     if (! options.doNotPublishBuild) {
-      createAndPublishBuiltPackage(conn, isopack);
-      if (buildmessage.jobHasMessages())
+      createAndPublishBuiltPackage(
+        conn, isopack, projectContext.isopackCache);
+
+      if (buildmessage.jobHasMessages()) {
         return;
+      }
     }
 
     // XXX check that we're actually providing something new?
@@ -751,14 +791,16 @@ exports.publishPackage = function (options) {
         containsPlugins: packageSource.containsPlugins(),
         debugOnly: packageSource.debugOnly,
         prodOnly: packageSource.prodOnly,
+        testOnly: packageSource.testOnly,
         exports: packageSource.getExports(),
         releaseName: release.current.name,
         dependencies: packageDeps
       };
       uploadInfo = callPackageServerBM(conn, 'createPackageVersion', uploadRec);
     });
-    if (buildmessage.jobHasMessages())
+    if (buildmessage.jobHasMessages()) {
       return;
+    }
 
     // XXX If package version already exists, print a nice error message
     // telling them to try 'meteor publish-for-arch' if they want to
@@ -769,19 +811,26 @@ exports.publishPackage = function (options) {
     buildmessage.enterJob("uploading documentation", function () {
       uploadFile(uploadInfo.readmeUrl, readmePath);
     });
-    if (buildmessage.jobHasMessages())
+    if (buildmessage.jobHasMessages()) {
       return;
+    }
 
     buildmessage.enterJob("uploading source", function () {
       uploadFile(uploadInfo.uploadUrl, sourceBundleResult.sourceTarball);
     });
-    if (buildmessage.jobHasMessages())
+    if (buildmessage.jobHasMessages()) {
       return;
+    }
 
     if (! options.doNotPublishBuild) {
-      var bundleResult = createBuiltPackage(conn, isopack);
-      if (buildmessage.jobHasMessages())
+      var bundleResult = createBuiltPackage(
+        isopack,
+        projectContext.isopackCache,
+      );
+
+      if (buildmessage.jobHasMessages()) {
         return;
+      }
     }
 
     var hashes = {
@@ -793,13 +842,15 @@ exports.publishPackage = function (options) {
       callPackageServerBM(
         conn, 'publishPackageVersion', uploadInfo.uploadToken, hashes);
     });
-    if (buildmessage.jobHasMessages())
+    if (buildmessage.jobHasMessages()) {
       return;
+    }
 
     if (! options.doNotPublishBuild) {
       publishBuiltPackage(conn, isopack, bundleResult);
-      if (buildmessage.jobHasMessages())
+      if (buildmessage.jobHasMessages()) {
         return;
+      }
     }
   }
 

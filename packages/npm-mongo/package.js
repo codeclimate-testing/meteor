@@ -3,17 +3,17 @@
 
 Package.describe({
   summary: "Wrapper around the mongo npm package",
-  version: '1.4.39_1',
+  version: '2.2.31',
   documentation: null
 });
 
 Npm.depends({
-  // 1.4.32 (and bson 0.2.18) with optional native dependencies (bson native
-  // piece and kerberos) ripped out, which means we don't have to do the
-  // publish-for-arch dance every time we make a Meteor release.
-  // XXX move the npm dependency into a non-core versioned package and allow
-  //     it to use C++ bson
-  mongodb: "https://github.com/meteor/node-mongodb-native/tarball/9c7441e87fbec059dc0b70bbb70734404b994d71"
+  // Fork of mongodb@2.2.31 whose only change is pointing at a mongodb-core
+  // with https://github.com/mongodb-js/mongodb-core/pull/224
+  // NOTE: For the time being, we have hard-coded "2.2.31" as the version
+  // number in wrapper.js. When reverting back to non-fork, revert that
+  // change too!
+  mongodb: "https://github.com/meteor/node-mongodb-native/tarball/0f54d887aef0f172fd48cf4eafd0cf7e5a2500af",
 });
 
 Package.onUse(function (api) {

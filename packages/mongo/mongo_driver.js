@@ -7,10 +7,8 @@
  * these outside of a fiber they will explode!
  */
 
-var path = Npm.require('path');
 var MongoDB = NpmModuleMongodb;
-var Fiber = Npm.require('fibers');
-var Future = Npm.require(path.join('fibers', 'future'));
+var Future = Npm.require('fibers/future');
 
 MongoInternals = {};
 MongoTest = {};
@@ -63,8 +61,7 @@ var replaceMongoAtomWithMeteor = function (document) {
   if (document instanceof MongoDB.ObjectID) {
     return new Mongo.ObjectID(document.toHexString());
   }
-  if (document["EJSON$type"] && document["EJSON$value"]
-      && _.size(document) === 2) {
+  if (document["EJSON$type"] && document["EJSON$value"] && _.size(document) === 2) {
     return EJSON.fromJSONValue(replaceNames(unmakeMongoLegal, document));
   }
   if (document instanceof MongoDB.Timestamp) {
@@ -130,14 +127,13 @@ MongoConnection = function (url, options) {
   self._observeMultiplexers = {};
   self._onFailoverHook = new Hook;
 
-  var mongoOptions = {db: {safe: true}, server: {}, replSet: {}};
-
-  // Set autoReconnect to true, unless passed on the URL. Why someone
-  // would want to set autoReconnect to false, I'm not really sure, but
-  // keeping this for backwards compatibility for now.
-  if (!(/[\?&]auto_?[rR]econnect=/.test(url))) {
-    mongoOptions.server.auto_reconnect = true;
-  }
+  var mongoOptions = Object.assign({
+    // Reconnect on error.
+    autoReconnect: true,
+    // Try to reconnect forever, instead of stopping after 30 tries (the
+    // default), with each attempt separated by 1000ms.
+    reconnectTries: Infinity
+  }, Mongo._connectionOptions);
 
   // Disable the native parser by default, unless specifically enabled
   // in the mongo URL.
@@ -148,16 +144,15 @@ MongoConnection = function (url, options) {
   //   to a different platform (aka deploy)
   // We should revisit this after binary npm module support lands.
   if (!(/[\?&]native_?[pP]arser=/.test(url))) {
-    mongoOptions.db.native_parser = false;
+    mongoOptions.native_parser = false;
   }
 
-  // XXX maybe we should have a better way of allowing users to configure the
-  // underlying Mongo driver
+  // Internally the oplog connections specify their own poolSize
+  // which we don't want to overwrite with any user defined value
   if (_.has(options, 'poolSize')) {
     // If we just set this for "server", replSet will override it. If we just
     // set it for replSet, it will be ignored if we're not using a replSet.
-    mongoOptions.server.poolSize = options.poolSize;
-    mongoOptions.replSet.poolSize = options.poolSize;
+    mongoOptions.poolSize = options.poolSize;
   }
 
   self.db = null;
@@ -180,8 +175,10 @@ MongoConnection = function (url, options) {
         }
 
         // First, figure out what the current primary is, if any.
-        if (db.serverConfig._state.master)
-          self._primary = db.serverConfig._state.master.name;
+        if (db.serverConfig.isMasterDoc) {
+          self._primary = db.serverConfig.isMasterDoc.primary;
+        }
+
         db.serverConfig.on(
           'joined', Meteor.bindEnvironment(function (kind, doc) {
             if (kind === 'primary') {
@@ -269,12 +266,12 @@ MongoConnection.prototype._createCappedCollection = function (
 // after the observer notifiers have added themselves to the write
 // fence), you should call 'committed()' on the object returned.
 MongoConnection.prototype._maybeBeginWrite = function () {
-  var self = this;
   var fence = DDPServer._CurrentWriteFence.get();
-  if (fence)
+  if (fence) {
     return fence.beginWrite();
-  else
+  } else {
     return {committed: function () {}};
+  }
 };
 
 // Internal interface: adds a callback which is called when the Mongo primary
@@ -318,10 +315,11 @@ var writeCallback = function (write, refresh, callback) {
       }
     }
     write.committed();
-    if (callback)
+    if (callback) {
       callback(err, result);
-    else if (err)
+    } else if (err) {
       throw err;
+    }
   };
 };
 
@@ -362,16 +360,15 @@ MongoConnection.prototype._insert = function (collection_name, document,
     var collection = self.rawCollection(collection_name);
     collection.insert(replaceTypes(document, replaceMeteorAtomWithMongo),
                       {safe: true}, callback);
-  } catch (e) {
+  } catch (err) {
     write.committed();
-    throw e;
+    throw err;
   }
 };
 
 // Cause queries that may be affected by the selector to poll in this write
 // fence.
 MongoConnection.prototype._refresh = function (collectionName, selector) {
-  var self = this;
   var refreshKey = {collection: collectionName};
   // If we know which documents we're removing, don't poll queries that are
   // specific to other documents. (Note that multiple notifications here should
@@ -394,10 +391,11 @@ MongoConnection.prototype._remove = function (collection_name, selector,
   if (collection_name === "___meteor_failure_test_collection") {
     var e = new Error("Failure test");
     e.expected = true;
-    if (callback)
+    if (callback) {
       return callback(e);
-    else
+    } else {
       throw e;
+    }
   }
 
   var write = self._maybeBeginWrite();
@@ -408,11 +406,14 @@ MongoConnection.prototype._remove = function (collection_name, selector,
 
   try {
     var collection = self.rawCollection(collection_name);
+    var wrappedCallback = function(err, driverResult) {
+      callback(err, transformResult(driverResult).numberAffected);
+    };
     collection.remove(replaceTypes(selector, replaceMeteorAtomWithMongo),
-                      {safe: true}, callback);
-  } catch (e) {
+                       {safe: true}, wrappedCallback);
+  } catch (err) {
     write.committed();
-    throw e;
+    throw err;
   }
 };
 
@@ -466,10 +467,11 @@ MongoConnection.prototype._update = function (collection_name, selector, mod,
   if (collection_name === "___meteor_failure_test_collection") {
     var e = new Error("Failure test");
     e.expected = true;
-    if (callback)
+    if (callback) {
       return callback(e);
-    else
+    } else {
       throw e;
+    }
   }
 
   // explicit safety check. null and undefined can crash the mongo
@@ -485,7 +487,6 @@ MongoConnection.prototype._update = function (collection_name, selector, mod,
     throw new Error(
       "Only plain objects may be used as replacement" +
         " documents in MongoDB");
-    return;
   }
 
   if (!options) options = {};
@@ -509,63 +510,104 @@ MongoConnection.prototype._update = function (collection_name, selector, mod,
     var mongoSelector = replaceTypes(selector, replaceMeteorAtomWithMongo);
     var mongoMod = replaceTypes(mod, replaceMeteorAtomWithMongo);
 
-    var isModify = isModificationMod(mongoMod);
-    var knownId = selector._id || mod._id;
+    var isModify = LocalCollection._isModificationMod(mongoMod);
 
-    if (options._forbidReplace && ! isModify) {
-      var e = new Error("Invalid modifier. Replacements are forbidden.");
+    if (options._forbidReplace && !isModify) {
+      var err = new Error("Invalid modifier. Replacements are forbidden.");
       if (callback) {
-        return callback(e);
+        return callback(err);
       } else {
-        throw e;
+        throw err;
       }
     }
 
-    if (options.upsert && (! knownId) && options.insertedId) {
-      // XXX If we know we're using Mongo 2.6 (and this isn't a replacement)
-      //     we should be able to just use $setOnInsert instead of this
-      //     simulated upsert thing. (We can't use $setOnInsert with
-      //     replacements because there's nowhere to write it, and $setOnInsert
-      //     can't set _id on Mongo 2.4.)
-      //
-      //     Also, in the future we could do a real upsert for the mongo id
-      //     generation case, if the the node mongo driver gives us back the id
-      //     of the upserted doc (which our current version does not).
-      //
-      //     For more context, see
-      //     https://github.com/meteor/meteor/issues/2278#issuecomment-64252706
+    // We've already run replaceTypes/replaceMeteorAtomWithMongo on
+    // selector and mod.  We assume it doesn't matter, as far as
+    // the behavior of modifiers is concerned, whether `_modify`
+    // is run on EJSON or on mongo-converted EJSON.
+
+    // Run this code up front so that it fails fast if someone uses
+    // a Mongo update operator we don't support.
+    let knownId;
+    if (options.upsert) {
+      try {
+        let newDoc = LocalCollection._createUpsertDocument(selector, mod);
+        knownId = newDoc._id;
+      } catch (err) {
+        if (callback) {
+          return callback(err);
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    if (options.upsert &&
+        ! isModify &&
+        ! knownId &&
+        options.insertedId &&
+        ! (options.insertedId instanceof Mongo.ObjectID &&
+           options.generatedId)) {
+      // In case of an upsert with a replacement, where there is no _id defined
+      // in either the query or the replacement doc, mongo will generate an id itself. 
+      // Therefore we need this special strategy if we want to control the id ourselves.
+
+      // We don't need to do this when:
+      // - This is not a replacement, so we can add an _id to $setOnInsert
+      // - The id is defined by query or mod we can just add it to the replacement doc
+      // - The user did not specify any id preference and the id is a Mongo ObjectId, 
+      //     then we can just let Mongo generate the id
+
       simulateUpsertWithInsertedId(
-        collection, mongoSelector, mongoMod,
-        isModify, options,
+        collection, mongoSelector, mongoMod, options,
         // This callback does not need to be bindEnvironment'ed because
         // simulateUpsertWithInsertedId() wraps it and then passes it through
         // bindEnvironmentForWrite.
-        function (err, result) {
+        function (error, result) {
           // If we got here via a upsert() call, then options._returnObject will
           // be set and we should return the whole object. Otherwise, we should
           // just return the number of affected docs to match the mongo API.
-          if (result && ! options._returnObject)
-            callback(err, result.numberAffected);
-          else
-            callback(err, result);
+          if (result && ! options._returnObject) {
+            callback(error, result.numberAffected);
+          } else {
+            callback(error, result);
+          }
         }
       );
     } else {
+      
+      if (options.upsert && !knownId && options.insertedId && isModify) {
+        if (!mongoMod.hasOwnProperty('$setOnInsert')) {
+          mongoMod.$setOnInsert = {};
+        }
+        knownId = options.insertedId;
+        Object.assign(mongoMod.$setOnInsert, replaceTypes({_id: options.insertedId}, replaceMeteorAtomWithMongo));
+      }
+      
       collection.update(
         mongoSelector, mongoMod, mongoOpts,
-        bindEnvironmentForWrite(function (err, result, extra) {
+        bindEnvironmentForWrite(function (err, result) {
           if (! err) {
-            if (result && options._returnObject) {
-              result = { numberAffected: result };
+            var meteorResult = transformResult(result);
+            if (meteorResult && options._returnObject) {
               // If this was an upsert() call, and we ended up
               // inserting a new doc and we know its id, then
               // return that id as well.
-              if (options.upsert && knownId &&
-                  ! extra.updatedExisting)
-                result.insertedId = knownId;
+              if (options.upsert && meteorResult.insertedId) {
+                if (knownId) {
+                  meteorResult.insertedId = knownId;
+                } else if (meteorResult.insertedId instanceof MongoDB.ObjectID) {
+                  meteorResult.insertedId = new Mongo.ObjectID(meteorResult.insertedId.toHexString());
+                }
+              }
+
+              callback(err, meteorResult);
+            } else {
+              callback(err, meteorResult.numberAffected);
             }
+          } else {
+            callback(err);
           }
-          callback(err, result);
         }));
     }
   } catch (e) {
@@ -574,103 +616,65 @@ MongoConnection.prototype._update = function (collection_name, selector, mod,
   }
 };
 
-var isModificationMod = function (mod) {
-  var isReplace = false;
-  var isModify = false;
-  for (var k in mod) {
-    if (k.substr(0, 1) === '$') {
-      isModify = true;
+var transformResult = function (driverResult) {
+  var meteorResult = { numberAffected: 0 };
+  if (driverResult) {
+    var mongoResult = driverResult.result;
+
+    // On updates with upsert:true, the inserted values come as a list of
+    // upserted values -- even with options.multi, when the upsert does insert,
+    // it only inserts one element.
+    if (mongoResult.upserted) {
+      meteorResult.numberAffected += mongoResult.upserted.length;
+
+      if (mongoResult.upserted.length == 1) {
+        meteorResult.insertedId = mongoResult.upserted[0]._id;
+      }
     } else {
-      isReplace = true;
+      meteorResult.numberAffected = mongoResult.n;
     }
   }
-  if (isModify && isReplace) {
-    throw new Error(
-      "Update parameter cannot have both modifier and non-modifier fields.");
-  }
-  return isModify;
+
+  return meteorResult;
 };
+
 
 var NUM_OPTIMISTIC_TRIES = 3;
 
 // exposed for testing
 MongoConnection._isCannotChangeIdError = function (err) {
-  // First check for what this error looked like in Mongo 2.4.  Either of these
-  // checks should work, but just to be safe...
-  if (err.code === 13596)
-    return true;
-  if (err.err.indexOf("cannot change _id of a document") === 0)
-    return true;
 
-  // Now look for what it looks like in Mongo 2.6.  We don't use the error code
-  // here, because the error code we observed it producing (16837) appears to be
+  // Mongo 3.2.* returns error as next Object:
+  // {name: String, code: Number, errmsg: String}
+  // Older Mongo returns:
+  // {name: String, code: Number, err: String}
+  var error = err.errmsg || err.err;
+
+  // We don't use the error code here
+  // because the error code we observed it producing (16837) appears to be
   // a far more generic error code based on examining the source.
-  if (err.err.indexOf("The _id field cannot be changed") === 0)
+  if (error.indexOf('The _id field cannot be changed') === 0
+    || error.indexOf("the (immutable) field '_id' was found to have been altered to _id") !== -1) {
     return true;
+  }
 
   return false;
 };
 
 var simulateUpsertWithInsertedId = function (collection, selector, mod,
-                                             isModify, options, callback) {
-  // STRATEGY:  First try doing a plain update.  If it affected 0 documents,
-  // then without affecting the database, we know we should probably do an
-  // insert.  We then do a *conditional* insert that will fail in the case
-  // of a race condition.  This conditional insert is actually an
-  // upsert-replace with an _id, which will never successfully update an
-  // existing document.  If this upsert fails with an error saying it
-  // couldn't change an existing _id, then we know an intervening write has
-  // caused the query to match something.  We go back to step one and repeat.
+                                             options, callback) {
+  // STRATEGY: First try doing an upsert with a generated ID.
+  // If this throws an error about changing the ID on an existing document
+  // then without affecting the database, we know we should probably try
+  // an update without the generated ID. If it affected 0 documents, 
+  // then without affecting the database, we the document that first
+  // gave the error is probably removed and we need to try an insert again
+  // We go back to step one and repeat.
   // Like all "optimistic write" schemes, we rely on the fact that it's
   // unlikely our writes will continue to be interfered with under normal
   // circumstances (though sufficiently heavy contention with writers
   // disagreeing on the existence of an object will cause writes to fail
   // in theory).
-
-  var newDoc;
-  // Run this code up front so that it fails fast if someone uses
-  // a Mongo update operator we don't support.
-  if (isModify) {
-    // We've already run replaceTypes/replaceMeteorAtomWithMongo on
-    // selector and mod.  We assume it doesn't matter, as far as
-    // the behavior of modifiers is concerned, whether `_modify`
-    // is run on EJSON or on mongo-converted EJSON.
-    var selectorDoc = LocalCollection._removeDollarOperators(selector);
-
-    newDoc = selectorDoc;
-
-    // Convert dotted keys into objects. (Resolves issue #4522).
-    _.each(newDoc, function (value, key) {
-      var trail = key.split(".");
-
-      if (trail.length > 1) {
-        //Key is dotted. Convert it into an object.
-        delete newDoc[key];
-
-        var obj = newDoc,
-            leaf = trail.pop();
-
-        // XXX It is not quite certain what should be done if there are clashing
-        // keys on the trail of the dotted key. For now we will just override it
-        // It wouldn't be a very sane query in the first place, but should look
-        // up what mongo does in this case.
-
-        while ((key = trail.shift())) {
-          if (typeof obj[key] !== "object") {
-            obj[key] = {};
-          }
-
-          obj = obj[key];
-        }
-
-        obj[leaf] = value;
-      }
-    });
-
-    LocalCollection._modify(newDoc, mod, {isInsert: true});
-  } else {
-    newDoc = mod;
-  }
 
   var insertedId = options.insertedId; // must exist
   var mongoOptsForUpdate = {
@@ -682,6 +686,10 @@ var simulateUpsertWithInsertedId = function (collection, selector, mod,
     upsert: true
   };
 
+  var replacementWithId = Object.assign(
+    replaceTypes({_id: insertedId}, replaceMeteorAtomWithMongo),
+    mod);
+
   var tries = NUM_OPTIMISTIC_TRIES;
 
   var doUpdate = function () {
@@ -691,22 +699,20 @@ var simulateUpsertWithInsertedId = function (collection, selector, mod,
     } else {
       collection.update(selector, mod, mongoOptsForUpdate,
                         bindEnvironmentForWrite(function (err, result) {
-                          if (err)
+                          if (err) {
                             callback(err);
-                          else if (result)
+                          } else if (result && result.result.n != 0) {
                             callback(null, {
-                              numberAffected: result
+                              numberAffected: result.result.n
                             });
-                          else
+                          } else {
                             doConditionalInsert();
+                          }
                         }));
     }
   };
 
   var doConditionalInsert = function () {
-    var replacementWithId = _.extend(
-      replaceTypes({_id: insertedId}, replaceMeteorAtomWithMongo),
-      newDoc);
     collection.update(selector, replacementWithId, mongoOptsForInsert,
                       bindEnvironmentForWrite(function (err, result) {
                         if (err) {
@@ -720,8 +726,8 @@ var simulateUpsertWithInsertedId = function (collection, selector, mod,
                           }
                         } else {
                           callback(null, {
-                            numberAffected: result,
-                            insertedId: insertedId
+                            numberAffected: result.result.upserted.length,
+                            insertedId: insertedId,
                           });
                         }
                       }));
@@ -898,7 +904,7 @@ Cursor.prototype._publishCursor = function (sub) {
 Cursor.prototype._getCollectionName = function () {
   var self = this;
   return self._cursorDescription.collectionName;
-}
+};
 
 Cursor.prototype.observe = function (callbacks) {
   var self = this;
@@ -907,7 +913,25 @@ Cursor.prototype.observe = function (callbacks) {
 
 Cursor.prototype.observeChanges = function (callbacks) {
   var self = this;
+  var methods = [
+    'addedAt',
+    'added',
+    'changedAt',
+    'changed',
+    'removedAt',
+    'removed',
+    'movedTo'
+  ];
   var ordered = LocalCollection._observeChangesCallbacksAreOrdered(callbacks);
+
+  // XXX: Can we find out if callbacks are from observe?
+  var exceptionName = ' observe/observeChanges callback'; 
+  methods.forEach(function (method) {
+    if (callbacks[method] && typeof callbacks[method] == "function") {
+      callbacks[method] = Meteor.bindEnvironment(callbacks[method], method + exceptionName);
+    }
+  });
+  
   return self._mongo._observeChanges(
     self._cursorDescription, ordered, callbacks);
 };
@@ -949,6 +973,13 @@ MongoConnection.prototype._createSynchronousCursor = function(
   var dbCursor = collection.find(
     replaceTypes(cursorDescription.selector, replaceMeteorAtomWithMongo),
     cursorOptions.fields, mongoOptions);
+
+  if (typeof cursorOptions.maxTimeMs !== 'undefined') {
+    dbCursor = dbCursor.maxTimeMS(cursorOptions.maxTimeMs);
+  }
+  if (typeof cursorOptions.hint !== 'undefined') {
+    dbCursor = dbCursor.hint(cursorOptions.hint);
+  }
 
   return new SynchronousCursor(dbCursor, cursorDescription, options);
 };
@@ -1054,9 +1085,9 @@ _.extend(SynchronousCursor.prototype, {
     return self.map(_.identity);
   },
 
-  count: function () {
+  count: function (applySkipLimit = false) {
     var self = this;
-    return self._synchronousCount().wait();
+    return self._synchronousCount(applySkipLimit).wait();
   },
 
   // This method is NOT wrapped in Cursor.
@@ -1082,13 +1113,14 @@ MongoConnection.prototype.tail = function (cursorDescription, docCallback) {
   var cursor = self._createSynchronousCursor(cursorDescription);
 
   var stopped = false;
-  var lastTS = undefined;
+  var lastTS;
   var loop = function () {
+    var doc = null;
     while (true) {
       if (stopped)
         return;
       try {
-        var doc = cursor._nextObject();
+        doc = cursor._nextObject();
       } catch (err) {
         // There's no good way to figure out if this was actually an error
         // from Mongo. Ah well. But either way, we need to retry the cursor
@@ -1150,7 +1182,7 @@ MongoConnection.prototype._observeChanges = function (
     throw Error("You may not observe a cursor with {fields: {_id: 0}}");
   }
 
-  var observeKey = JSON.stringify(
+  var observeKey = EJSON.stringify(
     _.extend({ordered: ordered}, cursorDescription));
 
   var multiplexer, observeDriver;

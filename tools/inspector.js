@@ -145,7 +145,7 @@ DEp.connectToChildProcess = function connectToChildProcess(child) {
   // port (not debugPort!), and create a connection to that port so that
   // the child process can communicate with node-inspector.
   child.stderr.on("data", function onData(buffer) {
-    var match = /debugger listening on port (\d+)/
+    var match = /debugger listening on .+:(\d+)\n/i
       .exec(buffer.toString("utf8"));
     if (match) {
       child.stderr.removeListener("data", onData);
@@ -295,13 +295,20 @@ function banner(debugPort) {
   return [
     "",
     chalk.green([
-      "Your application is now paused and ready for debugging!",
+      "Your application is now ready for debugging!",
       "",
       "To debug the server process using a graphical debugging interface, ",
-      "visit this URL in your web browser:"
+      "visit this URL in your web browser:",
+      ""
     ].join(EOL)),
-    chalk.cyan(proc.url),
-    EOL
+    chalk.cyan("  " + proc.url),
+    chalk.green([
+      "",
+      "If your application is paused on a breakpoint but the code is not ",
+      "visible in the debugger, press the pause (||) button.",
+      ""
+    ].join(EOL)),
+    ""
   ].join(EOL);
 }
 

@@ -1,11 +1,8 @@
+# standard-minifiers
+[Source code of released version](https://github.com/meteor/meteor/tree/master/packages/standard-minifiers) | [Source code of development version](https://github.com/meteor/meteor/tree/devel/packages/standard-minifiers)
+***
+
 Standard Minifiers
 ===
 
-This package provides two minifier plugins used for Meteor apps by default.
-
-The JS minifier uses UglifyJS2. The options include name-mangling and other
-commonly used options.
-
-The CSS minifier mostly reduces amount of white-space parsing CSS with
-ParseCSS.
-
+This package includes the JS and CSS standard minifiers in your Meteor project.

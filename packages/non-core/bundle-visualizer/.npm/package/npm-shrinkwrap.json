@@ -1,0 +1,64 @@
+{
+  "dependencies": {
+    "d3-collection": {
+      "version": "1.0.4",
+      "resolved": "https://registry.npmjs.org/d3-collection/-/d3-collection-1.0.4.tgz",
+      "from": "d3-collection@1.0.4"
+    },
+    "d3-color": {
+      "version": "1.0.3",
+      "resolved": "https://registry.npmjs.org/d3-color/-/d3-color-1.0.3.tgz",
+      "from": "d3-color@>=1.0.0 <2.0.0"
+    },
+    "d3-dispatch": {
+      "version": "1.0.3",
+      "resolved": "https://registry.npmjs.org/d3-dispatch/-/d3-dispatch-1.0.3.tgz",
+      "from": "d3-dispatch@>=1.0.0 <2.0.0"
+    },
+    "d3-ease": {
+      "version": "1.0.3",
+      "resolved": "https://registry.npmjs.org/d3-ease/-/d3-ease-1.0.3.tgz",
+      "from": "d3-ease@>=1.0.0 <2.0.0"
+    },
+    "d3-hierarchy": {
+      "version": "1.1.4",
+      "resolved": "https://registry.npmjs.org/d3-hierarchy/-/d3-hierarchy-1.1.4.tgz",
+      "from": "d3-hierarchy@1.1.4"
+    },
+    "d3-interpolate": {
+      "version": "1.1.5",
+      "resolved": "https://registry.npmjs.org/d3-interpolate/-/d3-interpolate-1.1.5.tgz",
+      "from": "d3-interpolate@>=1.0.0 <2.0.0"
+    },
+    "d3-path": {
+      "version": "1.0.5",
+      "resolved": "https://registry.npmjs.org/d3-path/-/d3-path-1.0.5.tgz",
+      "from": "d3-path@>=1.0.0 <2.0.0"
+    },
+    "d3-selection": {
+      "version": "1.0.5",
+      "resolved": "https://registry.npmjs.org/d3-selection/-/d3-selection-1.0.5.tgz",
+      "from": "d3-selection@1.0.5"
+    },
+    "d3-shape": {
+      "version": "1.0.6",
+      "resolved": "https://registry.npmjs.org/d3-shape/-/d3-shape-1.0.6.tgz",
+      "from": "d3-shape@1.0.6"
+    },
+    "d3-timer": {
+      "version": "1.0.7",
+      "resolved": "https://registry.npmjs.org/d3-timer/-/d3-timer-1.0.7.tgz",
+      "from": "d3-timer@>=1.0.0 <2.0.0"
+    },
+    "d3-transition": {
+      "version": "1.0.4",
+      "resolved": "https://registry.npmjs.org/d3-transition/-/d3-transition-1.0.4.tgz",
+      "from": "d3-transition@1.0.4"
+    },
+    "pretty-bytes": {
+      "version": "4.0.2",
+      "resolved": "https://registry.npmjs.org/pretty-bytes/-/pretty-bytes-4.0.2.tgz",
+      "from": "pretty-bytes@4.0.2"
+    }
+  }
+}

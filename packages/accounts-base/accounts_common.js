@@ -7,7 +7,7 @@
  * - connection {Object} Optional DDP connection to reuse.
  * - ddpUrl {String} Optional URL for creating a new DDP connection.
  */
-AccountsCommon = class AccountsCommon {
+export class AccountsCommon {
   constructor(options) {
     // Currently this is read directly by packages like accounts-password
     // and accounts-ui-unstyled.
@@ -35,11 +35,16 @@ AccountsCommon = class AccountsCommon {
       bindEnvironment: false,
       debugPrintExceptions: "onLoginFailure callback"
     });
+
+    this._onLogoutHook = new Hook({
+      bindEnvironment: false,
+      debugPrintExceptions: "onLogout callback"
+    });
   }
 
   /**
    * @summary Get the current user id, or `null` if no user is logged in. A reactive data source.
-   * @locus Anywhere but publish functions
+   * @locus Anywhere
    */
   userId() {
     throw new Error("userId method not implemented");
@@ -47,7 +52,7 @@ AccountsCommon = class AccountsCommon {
 
   /**
    * @summary Get the current user record, or `null` if no user is logged in. A reactive data source.
-   * @locus Anywhere but publish functions
+   * @locus Anywhere
    */
   user() {
     var userId = this.userId();
@@ -78,6 +83,12 @@ AccountsCommon = class AccountsCommon {
   // - loginExpirationInDays {Number}
   //     Number of days since login until a user is logged out (login token
   //     expires).
+  // - passwordResetTokenExpirationInDays {Number}
+  //     Number of days since password reset token creation until the
+  //     token cannt be used any longer (password reset token expires).
+  // - ambiguousErrorMessages {Boolean}
+  //     Return ambiguous error messages from login failures to prevent
+  //     user enumeration.
 
   /**
    * @summary Set global accounts options.
@@ -88,6 +99,9 @@ AccountsCommon = class AccountsCommon {
    * @param {String | Function} options.restrictCreationByEmailDomain If set to a string, only allows new users if the domain part of their email address matches the string. If set to a function, only allows new users if the function returns true.  The function is passed the full email address of the proposed new user.  Works with password-based sign-in and external services that expose email addresses (Google, Facebook, GitHub). All existing users still can log in after enabling this option. Example: `Accounts.config({ restrictCreationByEmailDomain: 'school.edu' })`.
    * @param {Number} options.loginExpirationInDays The number of days from when a user logs in until their token expires and they are logged out. Defaults to 90. Set to `null` to disable login expiration.
    * @param {String} options.oauthSecretKey When using the `oauth-encryption` package, the 16 byte key using to encrypt sensitive account credentials in the database, encoded in base64.  This option may only be specifed on the server.  See packages/oauth-encryption/README.md for details.
+   * @param {Number} options.passwordResetTokenExpirationInDays The number of days from when a link to reset password is sent until token expires and user can't reset password with the link anymore. Defaults to 3.
+   * @param {Number} options.passwordEnrollTokenExpirationInDays The number of days from when a link to set inital password is sent until token expires and user can't set password with the link anymore. Defaults to 30.
+   * @param {Boolean} options.ambiguousErrorMessages Return ambiguous error messages from login failures to prevent user enumeration. Defaults to false.
    */
   config(options) {
     var self = this;
@@ -119,8 +133,9 @@ AccountsCommon = class AccountsCommon {
     }
 
     // validate option keys
-    var VALID_KEYS = ["sendVerificationEmail", "forbidClientAccountCreation",
-                      "restrictCreationByEmailDomain", "loginExpirationInDays"];
+    var VALID_KEYS = ["sendVerificationEmail", "forbidClientAccountCreation", "passwordEnrollTokenExpirationInDays",
+                      "restrictCreationByEmailDomain", "loginExpirationInDays", "passwordResetTokenExpirationInDays",
+                      "ambiguousErrorMessages"];
     _.each(_.keys(options), function (key) {
       if (!_.contains(VALID_KEYS, key)) {
         throw new Error("Accounts.config: Invalid key: " + key);
@@ -154,6 +169,15 @@ AccountsCommon = class AccountsCommon {
    */
   onLoginFailure(func) {
     return this._onLoginFailureHook.register(func);
+  }
+
+  /**
+   * @summary Register a callback to be called after a logout attempt succeeds.
+   * @locus Anywhere
+   * @param {Function} func The callback to be called when logout is successful.
+   */
+  onLogout(func) {
+    return this._onLogoutHook.register(func);
   }
 
   _initConnection(options) {
@@ -190,8 +214,25 @@ AccountsCommon = class AccountsCommon {
   }
 
   _getTokenLifetimeMs() {
-    return (this._options.loginExpirationInDays ||
-            DEFAULT_LOGIN_EXPIRATION_DAYS) * 24 * 60 * 60 * 1000;
+    // When loginExpirationInDays is set to null, we'll use a really high
+    // number of days (LOGIN_UNEXPIRABLE_TOKEN_DAYS) to simulate an
+    // unexpiring token.
+    const loginExpirationInDays =
+      (this._options.loginExpirationInDays === null)
+        ? LOGIN_UNEXPIRING_TOKEN_DAYS
+        : this._options.loginExpirationInDays;
+    return (loginExpirationInDays
+        || DEFAULT_LOGIN_EXPIRATION_DAYS) * 24 * 60 * 60 * 1000;
+  }
+
+  _getPasswordResetTokenLifetimeMs() {
+    return (this._options.passwordResetTokenExpirationInDays ||
+            DEFAULT_PASSWORD_RESET_TOKEN_EXPIRATION_DAYS) * 24 * 60 * 60 * 1000;
+  }
+
+  _getPasswordEnrollTokenLifetimeMs() {
+    return (this._options.passwordEnrollTokenExpirationInDays ||
+        DEFAULT_PASSWORD_ENROLL_TOKEN_EXPIRATION_DAYS) * 24 * 60 * 60 * 1000;
   }
 
   _tokenExpiration(when) {
@@ -217,6 +258,7 @@ var Ap = AccountsCommon.prototype;
 /**
  * @summary Get the current user id, or `null` if no user is logged in. A reactive data source.
  * @locus Anywhere but publish functions
+ * @importFromPackage meteor
  */
 Meteor.userId = function () {
   return Accounts.userId();
@@ -225,13 +267,21 @@ Meteor.userId = function () {
 /**
  * @summary Get the current user record, or `null` if no user is logged in. A reactive data source.
  * @locus Anywhere but publish functions
+ * @importFromPackage meteor
  */
 Meteor.user = function () {
   return Accounts.user();
 };
 
 // how long (in days) until a login token expires
-var DEFAULT_LOGIN_EXPIRATION_DAYS = 90;
+const DEFAULT_LOGIN_EXPIRATION_DAYS = 90;
+// Expose for testing.
+Ap.DEFAULT_LOGIN_EXPIRATION_DAYS = DEFAULT_LOGIN_EXPIRATION_DAYS;
+
+// how long (in days) until reset password token expires
+var DEFAULT_PASSWORD_RESET_TOKEN_EXPIRATION_DAYS = 3;
+// how long (in days) until enrol password token expires
+var DEFAULT_PASSWORD_ENROLL_TOKEN_EXPIRATION_DAYS = 30;
 // Clients don't try to auto-login with a token that is going to expire within
 // .1 * DEFAULT_LOGIN_EXPIRATION_DAYS, capped at MIN_TOKEN_LIFETIME_CAP_SECS.
 // Tries to avoid abrupt disconnects from expiring tokens.
@@ -241,6 +291,12 @@ EXPIRE_TOKENS_INTERVAL_MS = 600 * 1000; // 10 minutes
 // how long we wait before logging out clients when Meteor.logoutOtherClients is
 // called
 CONNECTION_CLOSE_DELAY_MS = 10 * 1000;
+
+// A large number of expiration days (approximately 100 years worth) that is
+// used when creating unexpiring tokens.
+const LOGIN_UNEXPIRING_TOKEN_DAYS = 365 * 100;
+// Expose for testing.
+Ap.LOGIN_UNEXPIRING_TOKEN_DAYS = LOGIN_UNEXPIRING_TOKEN_DAYS;
 
 // loginServiceConfiguration and ConfigError are maintained for backwards compatibility
 Meteor.startup(function () {

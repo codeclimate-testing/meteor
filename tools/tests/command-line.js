@@ -315,6 +315,45 @@ selftest.define("argument parsing", function () {
   s.createApp('myapp', 'standard-app');
   s.cd('myapp', function () {
     run = s.run("list");
+    run.waitSecs(30);
+    run.expectExit(0);
+  });
+
+  s.createApp("app-with-extra-packages", "extra-packages-option", {
+    dontPrepareApp: true
+  });
+  s.cd("app-with-extra-packages", function () {
+    run = s.run("--extra-packages", "extra-package-1, extra-package-2@=0.0.2");
+    run.waitSecs(60);
+    run.match("extra-package-1: foobar");
+    run.match("extra-package-2: barfoo");
+    run.stop();
+  });
+
+  s.createApp("app-with-extra-packages", "extra-packages-option", {
+    dontPrepareApp: true
+  });
+  s.cd("app-with-extra-packages", function () {
+    run = s.run("test",
+      "--extra-packages", "practicalmeteor:mocha, extra-package-1, extra-package-2@=0.0.2",
+      "--driver-package", "practicalmeteor:mocha");
+    run.waitSecs(60);
+    run.match("extra-package-1: foobar");
+    run.match("extra-package-2: barfoo");
+    run.stop();
+  });
+
+  s.createApp("app-with-extra-packages", "extra-packages-option", {
+    dontPrepareApp: true
+  });
+  s.cd("app-with-extra-packages", function () {
+    run = s.run("test-packages", "--once",
+      "--driver-package", "test-server-tests-in-console-once",
+      "--extra-packages", "extra-package-1, extra-package-2@=0.0.2",
+      "extra-package-1", "extra-package-2");
+    run.waitSecs(60);
+    run.match("extra-package-1 - example test");
+    run.match("extra-package-2 - example test");
     run.expectExit(0);
   });
 });
@@ -340,6 +379,38 @@ selftest.define("command-like options", function () {
   run.expectExit(0);
 });
 
+selftest.define("rails reminders", function () {
+  var s = new Sandbox;
+  var run;
+
+  run = s.run("server");
+  run.matchErr("Did you mean 'meteor run'?");
+  run.expectExit(1);
+  run = s.run("console");
+  run.matchErr("Did you mean 'meteor shell'?");
+  run.expectExit(1);
+  run = s.run("new");
+  run.matchErr("Did you mean 'meteor create'?");
+  run.expectExit(1);
+  run = s.run("dbconsole");
+  run.matchErr("Did you mean 'meteor mongo'?");
+  run.expectExit(1);
+
+  // It should ignore args
+  run = s.run("server", "ignoredArg");
+  run.matchErr("Did you mean 'meteor run'?");
+  run.expectExit(1);
+  run = s.run("console", "ignoredArg");
+  run.matchErr("Did you mean 'meteor shell'?");
+  run.expectExit(1);
+  run = s.run("new", "ignoredArg");
+  run.matchErr("Did you mean 'meteor create'?");
+  run.expectExit(1);
+  run = s.run("dbconsole", "ignoredArg");
+  run.matchErr("Did you mean 'meteor mongo'?");
+  run.expectExit(1);
+});
+
 selftest.define("old cli tests (converted)", function () {
   var s = new Sandbox;
   var run;
@@ -359,7 +430,7 @@ selftest.define("old cli tests (converted)", function () {
   run = s.run("remove", "--help");
   run.match("Removes a package");
   run = s.run("list", "--help");
-  run.match("This will not list transitive dependencies");
+  run.match("Transitive dependencies are not listed unless");
   run = s.run("bundle", "--help");
   run.match("command has been deprecated");
   run = s.run("build", "--help");
@@ -411,7 +482,6 @@ selftest.define("old cli tests (converted)", function () {
   run.expectExit(0);
 
   selftest.expectTrue(files.stat(files.pathJoin(s.home, dir)).isDirectory());
-  selftest.expectTrue(files.stat(files.pathJoin(s.home, dir, dir + ".js")).isFile());
 
   s.cd(dir);
 
@@ -492,3 +562,75 @@ selftest.define("old cli tests (converted)", function () {
   run.expectExit(0);
   files.unlink(files.pathJoin(s.cwd, 'settings.js'));
 });
+
+// Added to address https://github.com/meteor/meteor/issues/8897.
+selftest.define(
+  'meteor test-packages --test-app-path directory',
+  function () {
+    var s = new Sandbox();
+    var run;
+
+    // If test-app-path doesn't exist, it should be created.
+    var testAppPath = '/tmp/meteor_test_app_path';
+    files.rm_recursive(testAppPath);
+    selftest.expectFalse(files.exists(testAppPath));
+    s.createApp('test-app-path-app', 'package-tests', {
+      dontPrepareApp: true
+    });
+    s.cd('test-app-path-app/packages/say-something', function () {
+      run = s.run(
+        'test-packages',
+        '--once',
+        { 'test-app-path': testAppPath },
+        './'
+      );
+      run.match('Started');
+      selftest.expectTrue(files.exists(testAppPath));
+      run.stop();
+      files.rm_recursive(testAppPath);
+    });
+
+    // If test-app-path already exists, make sure that directory is used.
+    var testAppPath = '/tmp/meteor_test_app_path';
+    files.rm_recursive(testAppPath);
+    files.mkdir_p(testAppPath);
+    selftest.expectTrue(files.exists(testAppPath));
+    selftest.expectFalse(files.exists(testAppPath + '/.meteor'));
+    s.createApp('test-app-path-app', 'package-tests', {
+      dontPrepareApp: true
+    });
+    s.cd('test-app-path-app/packages/say-something', function () {
+      run = s.run(
+        'test-packages',
+        '--once',
+        { 'test-app-path': testAppPath },
+        './'
+      );
+      run.match('Started');
+      selftest.expectTrue(files.exists(testAppPath + '/.meteor'));
+      run.stop();
+      files.rm_recursive(testAppPath);
+    });
+
+    // If test-app-path already exists but is a file instead of a directory,
+    // show a console error message explaining this, and exit.
+    var testAppPath = '/tmp/meteor_test_app_path';
+    files.rm_recursive(testAppPath);
+    files.writeFile(testAppPath, '<3 meteor');
+    selftest.expectTrue(files.exists(testAppPath));
+    s.createApp('test-app-path-app', 'package-tests', {
+      dontPrepareApp: true
+    });
+    s.cd('test-app-path-app/packages/say-something', function () {
+      run = s.run(
+        'test-packages',
+        '--once',
+        { 'test-app-path': testAppPath },
+        './'
+      );
+      run.matchErr('is not a directory');
+      run.expectExit(1);
+      files.rm_recursive(testAppPath);
+    });
+  }
+);

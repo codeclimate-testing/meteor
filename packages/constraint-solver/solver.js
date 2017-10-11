@@ -131,11 +131,11 @@ CS.Solver.prototype.analyze = function () {
     // throw if there are unknown packages in root deps
     if (analysis.unknownRootDeps.length) {
       _.each(analysis.unknownRootDeps, function (p) {
-        if (isIsobuildFeaturePackage(p)) {
+        if (CS.isIsobuildFeaturePackage(p)) {
           self.errors.push(
             'unsupported Isobuild feature "' + p +
             '" in top-level dependencies; see ' +
-            'https://github.com/meteor/meteor/wiki/Isobuild-Feature-Packages ' +
+            'https://docs.meteor.com/api/packagejs.html#isobuild-features ' +
             'for a list of features and the minimum Meteor release required'
           );
         } else {
@@ -506,8 +506,10 @@ CS.Solver.prototype.getVersionCostSteps = function (stepBaseName, packages,
     function () {
       _.each(packages, function (p) {
         var versions = self.getVersions(p);
-        var costs = self.pricer.priceVersions(versions, pricerMode);
-        addCostsToSteps(p, versions, costs, [major, minor, patch, rest]);
+        if (versions.length >= 2) {
+          var costs = self.pricer.priceVersions(versions, pricerMode);
+          addCostsToSteps(p, versions, costs, [major, minor, patch, rest]);
+        }
       });
     });
 
@@ -537,10 +539,12 @@ CS.Solver.prototype.getVersionDistanceSteps = function (stepBaseName,
         var pkg = pvArg.package;
         var previousVersion = pvArg.version;
         var versions = self.getVersions(pkg);
-        var costs = self.pricer.priceVersionsWithPrevious(
-          versions, previousVersion, takePatches);
-        addCostsToSteps(pkg, versions, costs,
-                        [incompat, major, minor, patch, rest]);
+        if (versions.length >= 2) {
+          var costs = self.pricer.priceVersionsWithPrevious(
+            versions, previousVersion, takePatches);
+          addCostsToSteps(pkg, versions, costs,
+                          [incompat, major, minor, patch, rest]);
+        }
       });
     });
 
@@ -857,9 +861,9 @@ CS.Solver.prototype._getAnswer = function (options) {
           return self.solution.evaluate(pv);
         });
         var errorStr;
-        if (isIsobuildFeaturePackage(p)) {
+        if (CS.isIsobuildFeaturePackage(p)) {
           errorStr = 'unsupported Isobuild feature "' + p + '"; see ' +
-            'https://github.com/meteor/meteor/wiki/Isobuild-Feature-Packages ' +
+            'https://docs.meteor.com/api/packagejs.html#isobuild-features ' +
             'for a list of features and the minimum Meteor release required';
         } else {
           errorStr = 'unknown package: ' + p;
@@ -1111,8 +1115,3 @@ CS.Solver.Constraint = function (fromVar, toPackage, vConstraint, conflictVar) {
   check(this.vConstraint, PV.VersionConstraint);
   check(this.conflictVar, String);
 };
-
-// This function is duplicated in tools/compiler.js.
-function isIsobuildFeaturePackage(packageName) {
-  return /^isobuild:/.test(packageName);
-}

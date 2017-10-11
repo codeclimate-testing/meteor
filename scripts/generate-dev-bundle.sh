@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -e
 set -u
@@ -16,55 +16,66 @@ echo BUILDING DEV BUNDLE "$BUNDLE_VERSION" IN "$DIR"
 
 cd "$DIR"
 
-S3_HOST="s3.amazonaws.com/com.meteor.jenkins"
+extractNodeFromTarGz() {
+    LOCAL_TGZ="${CHECKOUT_DIR}/node_${PLATFORM}_v${NODE_VERSION}.tar.gz"
+    if [ -f "$LOCAL_TGZ" ]
+    then
+        echo "Skipping download and installing Node from $LOCAL_TGZ" >&2
+        tar zxf "$LOCAL_TGZ"
+        return 0
+    fi
+    return 1
+}
 
-# Update these values after building the dev-bundle-node Jenkins project.
-# Also make sure to update NODE_VERSION in generate-dev-bundle.ps1.
-NODE_VERSION=0.10.40
-NODE_BUILD_NUMBER=18
-NODE_TGZ="node_${PLATFORM}_v${NODE_VERSION}.tar.gz"
-if [ -f "${CHECKOUT_DIR}/${NODE_TGZ}" ] ; then
-    tar zxf "${CHECKOUT_DIR}/${NODE_TGZ}"
-else
-    NODE_URL="https://${S3_HOST}/dev-bundle-node-${NODE_BUILD_NUMBER}/${NODE_TGZ}"
-    echo "Downloading Node from ${NODE_URL}"
-    curl "${NODE_URL}" | tar zx
-fi
+downloadNodeFromS3() {
+    S3_HOST="s3.amazonaws.com/com.meteor.jenkins"
+    S3_TGZ="node_${UNAME}_${ARCH}_v${NODE_VERSION}.tar.gz"
+    NODE_URL="https://${S3_HOST}/dev-bundle-node-${NODE_BUILD_NUMBER}/${S3_TGZ}"
+    echo "Downloading Node from ${NODE_URL}" >&2
+    curl "${NODE_URL}" | tar zx --strip-components 1
+}
 
-# Update these values after building the dev-bundle-mongo Jenkins project.
-# Also make sure to update MONGO_VERSION in generate-dev-bundle.ps1.
-MONGO_VERSION=2.6.7
-MONGO_BUILD_NUMBER=6
-MONGO_TGZ="mongo_${PLATFORM}_v${MONGO_VERSION}.tar.gz"
-if [ -f "${CHECKOUT_DIR}/${MONGO_TGZ}" ] ; then
-    tar zxf "${CHECKOUT_DIR}/${MONGO_TGZ}"
-else
-    MONGO_URL="https://${S3_HOST}/dev-bundle-mongo-${MONGO_BUILD_NUMBER}/${MONGO_TGZ}"
-    echo "Downloading Mongo from ${MONGO_URL}"
-    curl "${MONGO_URL}" | tar zx
-fi
+downloadOfficialNode() {
+    NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/${NODE_TGZ}"
+    echo "Downloading Node from ${NODE_URL}" >&2
+    curl "${NODE_URL}" | tar zx --strip-components 1
+}
 
-# Copy bundled npm to temporary directory so we can restore it later
-# We do this because the bundled node is built using PORTABLE=1,
-# which makes npm look for node relative to it's own directory
-# See build-node-for-dev-bundle.sh
-cp -R "$DIR/lib/node_modules/npm" "$DIR/bundled-npm"
+# Try each strategy in the following order:
+extractNodeFromTarGz || downloadNodeFromS3 || downloadOfficialNode
+
+# Download Mongo from mongodb.com
+MONGO_NAME="mongodb-${OS}-${ARCH}-${MONGO_VERSION}"
+MONGO_TGZ="${MONGO_NAME}.tgz"
+MONGO_URL="http://fastdl.mongodb.org/${OS}/${MONGO_TGZ}"
+echo "Downloading Mongo from ${MONGO_URL}"
+curl "${MONGO_URL}" | tar zx
+
+# Put Mongo binaries in the right spot (mongodb/bin)
+mkdir -p mongodb/bin
+mv "${MONGO_NAME}/bin/mongod" mongodb/bin
+mv "${MONGO_NAME}/bin/mongo" mongodb/bin
+rm -rf "${MONGO_NAME}"
 
 # export path so we use the downloaded node and npm
 export PATH="$DIR/bin:$PATH"
 
-# install npm 3 in a temporary directory
-mkdir "$DIR/bin/npm3"
-cd "$DIR/bin/npm3"
-npm install npm@3.1.2
-cp node_modules/npm/bin/npm .
-
-# export path again with our temporary npm3 directory first,
-# so we can use npm 3 during builds
-export PATH="$DIR/bin/npm3:$PATH"
+cd "$DIR/lib"
+# Overwrite the bundled version with the latest version of npm.
+npm install "npm@$NPM_VERSION"
 
 which node
 which npm
+npm version
+
+# Make node-gyp use Node headers and libraries from $DIR/include/node.
+export HOME="$DIR"
+export USERPROFILE="$DIR"
+export npm_config_nodedir="$DIR"
+
+INCLUDE_PATH="${DIR}/include/node"
+echo "Contents of ${INCLUDE_PATH}:"
+ls -al "$INCLUDE_PATH"
 
 # When adding new node modules (or any software) to the dev bundle,
 # remember to update LICENSE.txt! Also note that we include all the
@@ -78,7 +89,7 @@ which npm
 # will get confused by the pre-existing modules.
 mkdir "${DIR}/build/npm-server-install"
 cd "${DIR}/build/npm-server-install"
-node "${CHECKOUT_DIR}/scripts/dev-bundle-server-package.js" >package.json
+node "${CHECKOUT_DIR}/scripts/dev-bundle-server-package.js" > package.json
 npm install
 npm shrinkwrap
 
@@ -86,13 +97,14 @@ mkdir -p "${DIR}/server-lib/node_modules"
 # This ignores the stuff in node_modules/.bin, but that's OK.
 cp -R node_modules/* "${DIR}/server-lib/node_modules/"
 
+mkdir -p "${DIR}/etc"
 mv package.json npm-shrinkwrap.json "${DIR}/etc/"
 
 # Fibers ships with compiled versions of its C code for a dozen platforms. This
 # bloats our dev bundle. Remove all the ones other than our
 # architecture. (Expression based on build.js in fibers source.)
 shrink_fibers () {
-    FIBERS_ARCH=$(node -p -e 'process.platform + "-" + process.arch + "-v8-" + /[0-9]+\.[0-9]+/.exec(process.versions.v8)[0]')
+    FIBERS_ARCH=$(node -p -e 'process.platform + "-" + process.arch + "-" + process.versions.modules')
     mv $FIBERS_ARCH ..
     rm -rf *
     mv ../$FIBERS_ARCH .
@@ -108,6 +120,9 @@ cd "${DIR}/build/npm-tool-install"
 node "${CHECKOUT_DIR}/scripts/dev-bundle-tool-package.js" >package.json
 npm install
 cp -R node_modules/* "${DIR}/lib/node_modules/"
+# Also include node_modules/.bin, so that `meteor npm` can make use of
+# commands like node-gyp and node-pre-gyp.
+cp -R node_modules/.bin "${DIR}/lib/node_modules/"
 
 cd "${DIR}/lib"
 
@@ -125,10 +140,15 @@ delete () {
     rm -rf "$1"
 }
 
-delete browserstack-webdriver/docs
-delete browserstack-webdriver/lib/test
+delete npm/test
+delete npm/node_modules/node-gyp
+pushd npm/node_modules
+ln -s ../../node-gyp ./
+popd
 
 delete sqlite3/deps
+delete sqlite3/node_modules/nan
+delete sqlite3/node_modules/node-pre-gyp
 delete wordwrap/test
 delete moment/min
 
@@ -138,39 +158,20 @@ find . -path '*/esprima-fb/test' | xargs rm -rf
 cd "$DIR/lib/node_modules/fibers/bin"
 shrink_fibers
 
-# Download BrowserStackLocal binary.
-BROWSER_STACK_LOCAL_URL="https://browserstack-binaries.s3.amazonaws.com/BrowserStackLocal-07-03-14-$OS-$ARCH.gz"
-
-cd "$DIR/build"
-curl -O $BROWSER_STACK_LOCAL_URL
-gunzip BrowserStackLocal*
-mv BrowserStackLocal* BrowserStackLocal
-mv BrowserStackLocal "$DIR/bin/"
-
-# remove our temporary npm3 directory
-rm -rf "$DIR/bin/npm3"
-
 # Sanity check to see if we're not breaking anything by replacing npm
 INSTALLED_NPM_VERSION=$(cat "$DIR/lib/node_modules/npm/package.json" |
 xargs -0 node -e "console.log(JSON.parse(process.argv[1]).version)")
-if [ "$INSTALLED_NPM_VERSION" != "1.4.28" ]; then
+if [ "$INSTALLED_NPM_VERSION" != "$NPM_VERSION" ]; then
   echo "Unexpected NPM version in lib/node_modules: $INSTALLED_NPM_VERSION"
-  echo "We will be replacing it with our own version because the bundled node"
-  echo "is built using PORTABLE=1, which makes npm look for node relative to"
-  echo "its own directory."
   echo "Update this check if you know what you're doing."
   exit 1
 fi
-
-# Overwrite lib/modules/npm with bundled npm from temporary directory
-rm -rf "$DIR/lib/node_modules/npm"
-mv -f "$DIR/bundled-npm" "$DIR/lib/node_modules/npm"
 
 echo BUNDLING
 
 cd "$DIR"
 echo "${BUNDLE_VERSION}" > .bundle_version.txt
-rm -rf build
+rm -rf build CHANGELOG.md ChangeLog LICENSE README.md
 
 tar czf "${CHECKOUT_DIR}/dev_bundle_${PLATFORM}_${BUNDLE_VERSION}.tar.gz" .
 

@@ -5,7 +5,7 @@ var utils = require('../utils/utils.js');
 var archinfo = require('../utils/archinfo.js');
 var _ = require('underscore');
 
-selftest.define("wipe all packages", function () {
+selftest.define("wipe all packages", ['slow', 'custom-warehouse'], function () {
   var s = new Sandbox({
     warehouse: {
       v1: { tool: "meteor-tool@33.0.1", recommended: true },
@@ -29,6 +29,7 @@ selftest.define("wipe all packages", function () {
       isTest: false,
       debugOnly: false,
       prodOnly: false,
+      testOnly: false,
       containsPlugins: false
     };
   };
@@ -140,8 +141,12 @@ selftest.define("wipe all packages", function () {
 
   // Check that all other packages are wiped
   _.each(files.readdir(files.pathJoin(s.warehouse, 'packages')), function (p) {
-    if (p[0] === '.') return;
-    if (p === 'meteor-tool') return;
+    if (p[0] === '.') {
+      return;
+    }
+    if (p === 'meteor-tool') {
+      return;
+    }
     var contents = files.readdir(files.pathJoin(s.warehouse, 'packages', p));
     contents = _.filter(contents, notHidden);
     selftest.expectTrue(contents.length === 0);

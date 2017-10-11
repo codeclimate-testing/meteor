@@ -1,19 +1,21 @@
+import {AccountsCommon} from "./accounts_common.js";
+
 /**
  * @summary Constructor for the `Accounts` object on the client.
  * @locus Client
- * @class
+ * @class AccountsClient
  * @extends AccountsCommon
  * @instancename accountsClient
  * @param {Object} options an object with fields:
  * @param {Object} options.connection Optional DDP connection to reuse.
  * @param {String} options.ddpUrl Optional URL for creating a new DDP connection.
  */
-AccountsClient = class AccountsClient extends AccountsCommon {
+export class AccountsClient extends AccountsCommon {
   constructor(options) {
     super(options);
 
-    this._loggingIn = false;
-    this._loggingInDeps = new Tracker.Dependency;
+    this._loggingIn = new ReactiveVar(false);
+    this._loggingOut = new ReactiveVar(false);
 
     this._loginServicesHandle =
       this.connection.subscribe("meteor.loginServiceConfiguration");
@@ -26,6 +28,9 @@ AccountsClient = class AccountsClient extends AccountsCommon {
 
     // Defined in localstorage_token.js.
     this._initLocalStorage();
+
+    // This is for .registerClientLoginFunction & .callLoginFunction.
+    this._loginFuncs = {};
   }
 
   ///
@@ -41,10 +46,7 @@ AccountsClient = class AccountsClient extends AccountsCommon {
   // also uses it to make loggingIn() be true during the beginPasswordExchange
   // method call too.
   _setLoggingIn(x) {
-    if (this._loggingIn !== x) {
-      this._loggingIn = x;
-      this._loggingInDeps.changed();
-    }
+    this._loggingIn.set(x);
   }
 
   /**
@@ -52,8 +54,58 @@ AccountsClient = class AccountsClient extends AccountsCommon {
    * @locus Client
    */
   loggingIn() {
-    this._loggingInDeps.depend();
-    return this._loggingIn;
+    return this._loggingIn.get();
+  }
+
+  /**
+   * @summary True if a logout method (such as `Meteor.logout`) is currently in progress. A reactive data source.
+   * @locus Client
+   */
+  loggingOut() {
+    return this._loggingOut.get();
+  }
+
+  /**
+   * @summary Register a new login function on the client. Intended for OAuth package authors. You can call the login function by using
+   `Accounts.callLoginFunction` or `Accounts.callLoginFunction`.
+   * @locus Client
+   * @param {String} funcName The name of your login function. Used by `Accounts.callLoginFunction` and `Accounts.applyLoginFunction`.
+   Should be the OAuth provider name accordingly.
+   * @param {Function} func The actual function you want to call. Just write it in the manner of `loginWithFoo`.
+   */
+  registerClientLoginFunction(funcName, func) {
+    if (this._loginFuncs[funcName]) {
+      throw new Error(`${funcName} has been defined already`);
+    }
+    this._loginFuncs[funcName] = func;
+  }
+
+  /**
+   * @summary Call a login function defined using `Accounts.registerClientLoginFunction`. Excluding the first argument, all remaining
+   arguments are passed to the login function accordingly. Use `applyLoginFunction` if you want to pass in an arguments array that contains
+   all arguments for the login function.
+   * @locus Client
+   * @param {String} funcName The name of the login function you wanted to call.
+   */
+  callLoginFunction(funcName, ...funcArgs) {
+    if (!this._loginFuncs[funcName]) {
+      throw new Error(`${funcName} was not defined`);
+    }
+    return this._loginFuncs[funcName].apply(this, funcArgs);
+  }
+
+  /**
+   * @summary Same as ``callLoginFunction` but accept an `arguments` which contains all arguments for the login
+   function.
+   * @locus Client
+   * @param {String} funcName The name of the login function you wanted to call.
+   * @param {Array} funcArgs The `arguments` for the login function.
+   */
+  applyLoginFunction(funcName, funcArgs) {
+    if (!this._loginFuncs[funcName]) {
+      throw new Error(`${funcName} was not defined`);
+    }
+    return this._loginFuncs[funcName].apply(this, funcArgs);
   }
 
   /**
@@ -63,9 +115,11 @@ AccountsClient = class AccountsClient extends AccountsCommon {
    */
   logout(callback) {
     var self = this;
+    self._loggingOut.set(true);
     self.connection.apply('logout', [], {
       wait: true
     }, function (error, result) {
+      self._loggingOut.set(false);
       if (error) {
         callback && callback(error);
       } else {
@@ -130,9 +184,19 @@ var Ap = AccountsClient.prototype;
 /**
  * @summary True if a login method (such as `Meteor.loginWithPassword`, `Meteor.loginWithFacebook`, or `Accounts.createUser`) is currently in progress. A reactive data source.
  * @locus Client
+ * @importFromPackage meteor
  */
 Meteor.loggingIn = function () {
   return Accounts.loggingIn();
+};
+
+/**
+ * @summary True if a logout method (such as `Meteor.logout`) is currently in progress. A reactive data source.
+ * @locus Client
+ * @importFromPackage meteor
+ */
+Meteor.loggingOut = function () {
+  return Accounts.loggingOut();
 };
 
 ///
@@ -188,7 +252,7 @@ Ap.callLoginMethod = function (options) {
       });
     } else {
       self._onLoginFailureHook.each(function (callback) {
-        callback();
+        callback({ error });
         return true;
       });
     }
@@ -217,7 +281,17 @@ Ap.callLoginMethod = function (options) {
       // already logged in they will still get logged in on reconnect.
       // See issue #4970.
     } else {
-      self.connection.onReconnect = function () {
+      // First clear out any previously set Acccounts login onReconnect
+      // callback (to make sure we don't keep piling up duplicate callbacks,
+      // which would then all be triggered when reconnecting).
+      if (self._reconnectStopper) {
+        self._reconnectStopper.stop();
+      }
+
+      self._reconnectStopper = DDP.onReconnect(function (conn) {
+        if (conn != self.connection) {
+          return;
+        }
         reconnected = true;
         // If our token was updated in storage, use the latest one.
         var storedToken = self._storedLoginToken();
@@ -268,7 +342,7 @@ Ap.callLoginMethod = function (options) {
               loginCallbacks(error);
             }});
         }
-      };
+      });
     }
   };
 
@@ -316,9 +390,16 @@ Ap.callLoginMethod = function (options) {
 };
 
 Ap.makeClientLoggedOut = function () {
+  // Ensure client was successfully logged in before running logout hooks.
+  if (this.connection._userId) {
+    this._onLogoutHook.each(function (callback) {
+      callback();
+      return true;
+    });
+  }
   this._unstoreLoginToken();
   this.connection.setUserId(null);
-  this.connection.onReconnect = null;
+  this._reconnectStopper && this._reconnectStopper.stop();
 };
 
 Ap.makeClientLoggedIn = function (userId, token, tokenExpires) {
@@ -330,6 +411,7 @@ Ap.makeClientLoggedIn = function (userId, token, tokenExpires) {
  * @summary Log the user out.
  * @locus Client
  * @param {Function} [callback] Optional callback. Called with no arguments on success, or with a single `Error` argument on failure.
+ * @importFromPackage meteor
  */
 Meteor.logout = function (callback) {
   return Accounts.logout(callback);
@@ -339,6 +421,7 @@ Meteor.logout = function (callback) {
  * @summary Log out other clients logged in as the current user, but does not log out the client that calls this function.
  * @locus Client
  * @param {Function} [callback] Optional callback. Called with no arguments on success, or with a single `Error` argument on failure.
+ * @importFromPackage meteor
  */
 Meteor.logoutOtherClients = function (callback) {
   return Accounts.logoutOtherClients(callback);
@@ -425,5 +508,25 @@ if (Package.blaze) {
    */
   Package.blaze.Blaze.Template.registerHelper('loggingIn', function () {
     return Meteor.loggingIn();
+  });
+
+  /**
+   * @global
+   * @name  loggingOut
+   * @isHelper true
+   * @summary Calls [Meteor.loggingOut()](#meteor_loggingout).
+   */
+  Package.blaze.Blaze.Template.registerHelper('loggingOut', function () {
+    return Meteor.loggingOut();
+  });
+
+  /**
+   * @global
+   * @name  loggingInOrOut
+   * @isHelper true
+   * @summary Calls [Meteor.loggingIn()](#meteor_loggingin) or [Meteor.loggingOut()](#meteor_loggingout).
+   */
+  Package.blaze.Blaze.Template.registerHelper('loggingInOrOut', function () {
+    return (Meteor.loggingIn() || Meteor.loggingOut());
   });
 }

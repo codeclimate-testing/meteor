@@ -6,7 +6,7 @@
 var interceptedEmails = {}; // (email address) -> (array of options)
 
 // add html email templates that just contain the url
-Accounts.emailTemplates.resetPassword.html = 
+Accounts.emailTemplates.resetPassword.html =
   Accounts.emailTemplates.enrollAccount.html =
   Accounts.emailTemplates.verifyEmail.html = function (user, url) {
     return url;
@@ -26,7 +26,7 @@ Accounts.emailTemplates.headers = {
 
 EmailTest.hookSend(function (options) {
   var to = options.to;
-  if (!to || to.indexOf('intercept') === -1) {
+  if (!to || to.toUpperCase().indexOf('INTERCEPT') === -1) {
     return true; // go ahead and send
   } else {
     if (!interceptedEmails[to])

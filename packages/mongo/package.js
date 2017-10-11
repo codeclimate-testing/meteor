@@ -9,7 +9,7 @@
 
 Package.describe({
   summary: "Adaptor for using MongoDB and Minimongo over DDP",
-  version: '1.1.2'
+  version: '1.2.2'
 });
 
 Npm.depends({
@@ -22,11 +22,21 @@ Npm.strip({
 
 Package.onUse(function (api) {
   api.use('npm-mongo', 'server');
+  api.use('allow-deny');
 
-  api.use(['random', 'ejson', 'underscore', 'minimongo',
-           'ddp', 'tracker', 'diff-sequence', 'mongo-id'],
-          ['client', 'server']);
-  api.use('check', ['client', 'server']);
+  api.use([
+    'random',
+    'ejson',
+    'underscore',
+    'minimongo',
+    'ddp',
+    'tracker',
+    'diff-sequence',
+    'mongo-id',
+    'check',
+    'ecmascript',
+    'mongo-dev-server',
+  ]);
 
   // Binary Heap data structure is used to optimize oplog observe driver
   // performance.
@@ -65,6 +75,7 @@ Package.onUse(function (api) {
   api.addFiles('local_collection_driver.js', ['client', 'server']);
   api.addFiles('remote_collection_driver.js', 'server');
   api.addFiles('collection.js', ['client', 'server']);
+  api.addFiles('connection_options.js', 'server');
 });
 
 Package.onTest(function (api) {
@@ -75,6 +86,7 @@ Package.onTest(function (api) {
   // XXX test order dependency: the allow_tests "partial allow" test
   // fails if it is run before mongo_livedata_tests.
   api.addFiles('mongo_livedata_tests.js', ['client', 'server']);
+  api.addFiles('upsert_compatibility_test.js', 'server');
   api.addFiles('allow_tests.js', ['client', 'server']);
   api.addFiles('collection_tests.js', ['client', 'server']);
   api.addFiles('observe_changes_tests.js', ['client', 'server']);

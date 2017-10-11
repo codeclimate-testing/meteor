@@ -4,14 +4,27 @@
 // prompt for password
 // send RPC with or without password as required
 
-var files = require('../fs/files.js');
-var httpHelpers = require('../utils/http-helpers.js');
-var buildmessage = require('../utils/buildmessage.js');
-var config = require('./config.js');
-var auth = require('./auth.js');
-var _ = require('underscore');
-var stats = require('./stats.js');
-var Console = require('../console/console.js').Console;
+import {
+  pathJoin,
+  createTarGzStream,
+  getSettings,
+  mkdtemp,
+} from '../fs/files.js';
+import { request } from '../utils/http-helpers.js';
+import buildmessage from '../utils/buildmessage.js';
+import {
+  pollForRegistrationCompletion,
+  doInteractivePasswordLogin,
+  loggedInUsername,
+  isLoggedIn,
+  maybePrintRegistrationLink,
+} from './auth.js';
+import { recordPackages } from './stats.js';
+import { Console } from '../console/console.js';
+
+const hasOwn = Object.prototype.hasOwnProperty;
+
+const CAPABILITIES = ['showDeployMessages', 'canTransferAuthorization'];
 
 // Make a synchronous RPC to the "classic" MDG deploy API. The deploy
 // API has the following contract:
@@ -40,6 +53,8 @@ var Console = require('../console/console.js').Console;
 // - bodyStream: if provided, a stream to use as the request body
 // - any other parameters accepted by the node 'request' module, for example
 //   'qs' to set query string parameters
+// - printDeployURL: provided if we should show the deploy URL; set this
+//   for the first RPC of any user command
 //
 // Waits until server responds, then returns an object with the
 // following keys:
@@ -54,18 +69,24 @@ var Console = require('../console/console.js').Console;
 //   derived from either a transport-level exception, the response
 //   body, or a generic 'try again later' message, as appropriate
 
-var deployRpc = function (options) {
-  var genericError = "Server error (please try again later)";
-
-  options = _.clone(options);
-  options.headers = _.clone(options.headers || {});
-  if (options.headers.cookie)
+function deployRpc(options) {
+  options = Object.assign({}, options);
+  options.headers = Object.assign({}, options.headers || {});
+  if (options.headers.cookie) {
     throw new Error("sorry, can't combine cookie headers yet");
+  }
+  options.qs = Object.assign({}, options.qs, {capabilities: CAPABILITIES});
+
+  const deployURLBase = getDeployURL(options.site).await();
+
+  if (options.printDeployURL) {
+    Console.info("Talking to Galaxy servers at " + deployURLBase);
+  }
 
   // XXX: Reintroduce progress for upload
   try {
-    var result = httpHelpers.request(_.extend(options, {
-      url: config.getDeployUrl() + '/' + options.operation +
+    var result = request(Object.assign(options, {
+      url: deployURLBase + '/' + options.operation +
         (options.site ? ('/' + options.site) : ''),
       method: options.method || 'GET',
       bodyStream: options.bodyStream,
@@ -84,7 +105,12 @@ var deployRpc = function (options) {
   var ret = { statusCode: response.statusCode };
 
   if (response.statusCode !== 200) {
-    ret.errorMessage = body.length > 0 ? body : genericError;
+    if (body.length > 0) {
+      ret.errorMessage = body;
+    } else {
+      ret.errorMessage = "Server error " + response.statusCode +
+        " (please try again later)";
+    }
     return ret;
   }
 
@@ -93,25 +119,28 @@ var deployRpc = function (options) {
     try {
       ret.payload = JSON.parse(body);
     } catch (e) {
-      ret.errorMessage = genericError;
+      ret.errorMessage =
+        "Server error (please try again later)\n"
+        + "Invalid JSON: " + body;
       return ret;
     }
   } else if (contentType === "text/plain; charset=utf-8") {
     ret.message = body;
   }
 
-  var hasAllExpectedKeys = _.all(_.map(
-    options.expectPayload || [], function (key) {
-      return ret.payload && _.has(ret.payload, key);
-    }));
+  const hasAllExpectedKeys =
+    (options.expectPayload || [])
+      .map(key => ret.payload && hasOwn.call(ret.payload, key))
+      .every(x => x);
 
-  if ((options.expectPayload && ! _.has(ret, 'payload')) ||
-      (options.expectMessage && ! _.has(ret, 'message')) ||
+  if ((options.expectPayload && ! hasOwn.call(ret, 'payload')) ||
+      (options.expectMessage && ! hasOwn.call(ret, 'message')) ||
       ! hasAllExpectedKeys) {
     delete ret.payload;
     delete ret.message;
 
-    ret.errorMessage = genericError;
+    ret.errorMessage = "Server error (please try again later)\n" +
+      "Response missing expected keys.";
   }
 
   return ret;
@@ -134,8 +163,8 @@ var deployRpc = function (options) {
 //   accounts server but our authentication actually fails, then prompt
 //   the user to log in with a username and password and then resend the
 //   RPC.
-var authedRpc = function (options) {
-  var rpcOptions = _.clone(options);
+function authedRpc(options) {
+  var rpcOptions = Object.assign({}, options);
   var preflight = rpcOptions.preflight;
   delete rpcOptions.preflight;
 
@@ -143,10 +172,22 @@ var authedRpc = function (options) {
   var infoResult = deployRpc({
     operation: 'info',
     site: rpcOptions.site,
-    expectPayload: []
+    expectPayload: [],
+    qs: options.qs,
+    printDeployURL: options.printDeployURL
   });
+  delete rpcOptions.printDeployURL;
 
   if (infoResult.statusCode === 401 && rpcOptions.promptIfAuthFails) {
+    Console.error("Authentication failed or login token expired.");
+
+    if (!Console.isInteractive()) {
+      return {
+        statusCode: 401,
+        errorMessage: "login failed."
+      };
+    }
+
     // Our authentication didn't validate, so prompt the user to log in
     // again, and resend the RPC if the login succeeds.
     var username = Console.readLine({
@@ -157,7 +198,7 @@ var authedRpc = function (options) {
       username: username,
       suppressErrorMessage: true
     };
-    if (auth.doInteractivePasswordLogin(loginOptions)) {
+    if (doInteractivePasswordLogin(loginOptions)) {
       return authedRpc(options);
     } else {
       return {
@@ -172,49 +213,20 @@ var authedRpc = function (options) {
     return preflight ? { } : deployRpc(rpcOptions);
   }
 
-  if (infoResult.errorMessage)
+  if (infoResult.errorMessage) {
     return infoResult;
+  }
   var info = infoResult.payload;
 
-  if (! _.has(info, 'protection')) {
+  if (! hasOwn.call(info, 'protection')) {
     // Not protected.
     //
     // XXX should prompt the user to claim the app (only if deploying?)
     return preflight ? { } : deployRpc(rpcOptions);
   }
 
-  if (info.protection === "password") {
-    if (preflight) {
-      return { protection: info.protection };
-    }
-    // Password protected. Read a password, hash it, and include the
-    // hashed password as a query parameter when doing the RPC.
-    var password;
-    password = Console.readLine({
-      echo: false,
-      prompt: "Password: ",
-      stream: process.stderr
-    });
-
-    // Hash the password so we never send plaintext over the
-    // wire. Doesn't actually make us more secure, but it means we
-    // won't leak a user's password, which they might use on other
-    // sites too.
-    var crypto = require('crypto');
-    var hash = crypto.createHash('sha1');
-    hash.update('S3krit Salt!');
-    hash.update(password);
-    password = hash.digest('hex');
-
-    rpcOptions = _.clone(rpcOptions);
-    rpcOptions.qs = _.clone(rpcOptions.qs || {});
-    rpcOptions.qs.password = password;
-
-    return deployRpc(rpcOptions);
-  }
-
   if (info.protection === "account") {
-    if (! _.has(info, 'authorized')) {
+    if (! hasOwn.call(info, 'authorized')) {
       // Absence of this implies that we are not an authorized user on
       // this app
       if (preflight) {
@@ -222,7 +234,7 @@ var authedRpc = function (options) {
       } else {
         return {
           statusCode: null,
-          errorMessage: auth.isLoggedIn() ?
+          errorMessage: isLoggedIn() ?
             // XXX better error message (probably need to break out of
             // the 'errorMessage printed with brief prefix' pattern)
             "Not an authorized user on this site" :
@@ -248,26 +260,11 @@ var authedRpc = function (options) {
   };
 };
 
-// When the user is trying to do something with a legacy
-// password-protected app, instruct them to claim it with 'meteor
-// claim'.
-var printLegacyPasswordMessage = function (site) {
-  Console.error(
-    "\nThis site was deployed with an old version of Meteor that used " +
-    "site passwords instead of user accounts. Now we have a much better " +
-    "system, Meteor developer accounts.");
-  Console.error();
-  Console.error("If this is your site, please claim it into your account with");
-  Console.error(
-    Console.command("meteor claim " + site),
-    Console.options({ indent: 2 }));
-};
-
 // When the user is trying to do something with an app that they are not
 // authorized for, instruct them to get added via 'meteor authorized
 // --add' or switch accounts.
-var printUnauthorizedMessage = function () {
-  var username = auth.loggedInUsername();
+function printUnauthorizedMessage() {
+  var username = loggedInUsername();
   Console.error("Sorry, that site belongs to a different user.");
   if (username) {
     Console.error("You are currently logged in as " + username + ".");
@@ -284,7 +281,7 @@ var printUnauthorizedMessage = function () {
 // syntactically good, canonicalize it (this essentially means
 // stripping 'http://' or a trailing '/' if present) and return it. If
 // not, print an error message to stderr and return null.
-var canonicalizeSite = function (site) {
+function canonicalizeSite(site) {
   // There are actually two different bugs here. One is that the meteor deploy
   // server does not support apps whose total site length is greater than 63
   // (because of how it generates Mongo database names); that can be fixed on
@@ -301,8 +298,9 @@ var canonicalizeSite = function (site) {
   }
 
   var url = site;
-  if (!url.match(':\/\/'))
+  if (!url.match(':\/\/')) {
     url = 'http://' + url;
+  }
 
   var parsed = require('url').parse(url);
 
@@ -335,13 +333,16 @@ var canonicalizeSite = function (site) {
 //   send information about packages used by this app to the package
 //   stats server.
 // - buildOptions: the 'buildOptions' argument to the bundler
-var bundleAndDeploy = function (options) {
-  if (options.recordPackageUsage === undefined)
+// - rawOptions: any unknown options that were passed to the command line tool
+export function bundleAndDeploy(options) {
+  if (options.recordPackageUsage === undefined) {
     options.recordPackageUsage = true;
+  }
 
   var site = canonicalizeSite(options.site);
-  if (! site)
+  if (! site) {
     return 1;
+  }
 
   // We should give a username/password prompt if the user was logged in
   // but the credentials are expired, unless the user is logged in but
@@ -353,17 +354,19 @@ var bundleAndDeploy = function (options) {
   // they'll get an email prompt instead of a username prompt because
   // the command-line tool didn't have time to learn about their
   // username before the credential was expired.
-  auth.pollForRegistrationCompletion({
+  pollForRegistrationCompletion({
     noLogout: true
   });
-  var promptIfAuthFails = (auth.loggedInUsername() !== null);
+  var promptIfAuthFails = (loggedInUsername() !== null);
 
   // Check auth up front, rather than after the (potentially lengthy)
   // bundling process.
   var preflight = authedRpc({
     site: site,
     preflight: true,
-    promptIfAuthFails: promptIfAuthFails
+    promptIfAuthFails: promptIfAuthFails,
+    qs: options.rawOptions,
+    printDeployURL: true
   });
 
   if (preflight.errorMessage) {
@@ -371,29 +374,25 @@ var bundleAndDeploy = function (options) {
     return 1;
   }
 
-  if (preflight.protection === "password") {
-    printLegacyPasswordMessage(site);
-    Console.error("If it's not your site, please try a different name!");
-    return 1;
-
-  } else if (preflight.protection === "account" &&
+  if (preflight.protection === "account" &&
              ! preflight.authorized) {
     printUnauthorizedMessage();
     return 1;
   }
 
-  var buildDir = files.mkdtemp('build_tar');
-  var bundlePath = files.pathJoin(buildDir, 'bundle');
+  var buildDir = mkdtemp('build_tar');
+  var bundlePath = pathJoin(buildDir, 'bundle');
 
-  Console.info('Deploying to ' + site + '.');
+  Console.info('Deploying your app...');
 
   var settings = null;
   var messages = buildmessage.capture({
     title: "preparing to deploy",
     rootPath: process.cwd()
   }, function () {
-    if (options.settingsFile)
-      settings = files.getSettings(options.settingsFile);
+    if (options.settingsFile) {
+      settings = getSettings(options.settingsFile);
+    }
   });
 
   if (! messages.hasMessages()) {
@@ -403,11 +402,11 @@ var bundleAndDeploy = function (options) {
       projectContext: options.projectContext,
       outputPath: bundlePath,
       buildOptions: options.buildOptions,
-      providePackageJSONForUnavailableBinaryDeps: !!process.env.METEOR_BINARY_DEP_WORKAROUND,
     });
 
-    if (bundleResult.errors)
+    if (bundleResult.errors) {
       messages = bundleResult.errors;
+    }
   }
 
   if (messages.hasMessages()) {
@@ -417,7 +416,7 @@ var bundleAndDeploy = function (options) {
   }
 
   if (options.recordPackageUsage) {
-    stats.recordPackages({
+    recordPackages({
       what: "sdk.deploy",
       projectContext: options.projectContext,
       site: site
@@ -429,55 +428,62 @@ var bundleAndDeploy = function (options) {
       method: 'POST',
       operation: 'deploy',
       site: site,
-      qs: settings !== null ? {settings: settings} : {},
-      bodyStream: files.createTarGzStream(files.pathJoin(buildDir, 'bundle')),
+      qs: Object.assign({}, options.rawOptions, settings !== null ? {settings: settings} : {}),
+      bodyStream: createTarGzStream(pathJoin(buildDir, 'bundle')),
       expectPayload: ['url'],
-      preflightPassword: preflight.preflightPassword
+      preflightPassword: preflight.preflightPassword,
+      // Disable the HTTP timeout for this POST request.
+      timeout: null,
     });
   });
-
 
   if (result.errorMessage) {
     Console.error("\nError deploying application: " + result.errorMessage);
     return 1;
   }
 
-  var deployedAt = require('url').parse(result.payload.url);
-  var hostname = deployedAt.hostname;
+  if (result.payload.message) {
+    Console.info(result.payload.message);
+  } else {
+    var deployedAt = require('url').parse(result.payload.url);
+    var hostname = deployedAt.hostname;
 
-  Console.info('Now serving at http://' + hostname);
+    Console.info('Now serving at http://' + hostname);
 
-  if (! hostname.match(/meteor\.com$/)) {
-    var dns = require('dns');
-    dns.resolve(hostname, 'CNAME', function (err, cnames) {
-      if (err || cnames[0] !== 'origin.meteor.com') {
-        dns.resolve(hostname, 'A', function (err, addresses) {
-          if (err || addresses[0] !== '107.22.210.133') {
-            Console.info('-------------');
-            Console.info(
-              "You've deployed to a custom domain.",
-              "Please be sure to CNAME your hostname",
-              "to origin.meteor.com, or set an A record to 107.22.210.133.");
-            Console.info('-------------');
-          }
-        });
-      }
-    });
+    if (! hostname.match(/meteor\.com$/)) {
+      var dns = require('dns');
+      dns.resolve(hostname, 'CNAME', function (err, cnames) {
+        if (err || cnames[0] !== 'origin.meteor.com') {
+          dns.resolve(hostname, 'A', function (err, addresses) {
+            if (err || addresses[0] !== '107.22.210.133') {
+              Console.info('-------------');
+              Console.info(
+                "You've deployed to a custom domain.",
+                "Please be sure to CNAME your hostname",
+                "to origin.meteor.com, or set an A record to 107.22.210.133.");
+              Console.info('-------------');
+            }
+          });
+        }
+      });
+    }
   }
 
   return 0;
 };
 
-var deleteApp = function (site) {
+export function deleteApp(site) {
   site = canonicalizeSite(site);
-  if (! site)
+  if (! site) {
     return 1;
+  }
 
   var result = authedRpc({
     method: 'DELETE',
     operation: 'deploy',
     site: site,
-    promptIfAuthFails: true
+    promptIfAuthFails: true,
+    printDeployURL: true
   });
 
   if (result.errorMessage) {
@@ -497,12 +503,13 @@ var deleteApp = function (site) {
 // messages.  Returns the result of the RPC if successful, or null
 // otherwise (including if auth failed or if the user is not authorized
 // for this site).
-var checkAuthThenSendRpc = function (site, operation, what) {
+function checkAuthThenSendRpc(site, operation, what) {
   var preflight = authedRpc({
     operation: operation,
     site: site,
     preflight: true,
-    promptIfAuthFails: true
+    promptIfAuthFails: true,
+    printDeployURL: true
   });
 
   if (preflight.errorMessage) {
@@ -510,15 +517,12 @@ var checkAuthThenSendRpc = function (site, operation, what) {
     return null;
   }
 
-  if (preflight.protection === "password") {
-    printLegacyPasswordMessage(site);
-    return null;
-  } else if (preflight.protection === "account" &&
+  if (preflight.protection === "account" &&
              ! preflight.authorized) {
-    if (! auth.isLoggedIn()) {
+    if (! isLoggedIn()) {
       // Maybe the user is authorized for this app but not logged in
       // yet, so give them a login prompt.
-      var loginResult = auth.doUsernamePasswordLogin({ retry: true });
+      var loginResult = doUsernamePasswordLogin({ retry: true });
       if (loginResult) {
         // Once we've logged in, retry the whole operation. We need to
         // do the preflight request again instead of immediately moving
@@ -566,11 +570,12 @@ var checkAuthThenSendRpc = function (site, operation, what) {
 // On failure, prints a message to stderr and returns null. Otherwise,
 // returns a temporary authenticated Mongo URL allowing access to this
 // site's database.
-var temporaryMongoUrl = function (site) {
+export function temporaryMongoUrl(site) {
   site = canonicalizeSite(site);
-  if (! site)
+  if (! site) {
     // canonicalizeSite printed an error
     return null;
+  }
 
   var result = checkAuthThenSendRpc(site, 'mongo', 'open a mongo connection');
 
@@ -581,10 +586,11 @@ var temporaryMongoUrl = function (site) {
   }
 };
 
-var logs = function (site) {
+export function logs(site) {
   site = canonicalizeSite(site);
-  if (! site)
+  if (! site) {
     return 1;
+  }
 
   var result = checkAuthThenSendRpc(site, 'logs', 'view logs');
 
@@ -592,20 +598,22 @@ var logs = function (site) {
     return 1;
   } else {
     Console.info(result.message);
-    auth.maybePrintRegistrationLink({ leadingNewline: true });
+    maybePrintRegistrationLink({ leadingNewline: true });
     return 0;
   }
 };
 
-var listAuthorized = function (site) {
+export function listAuthorized(site) {
   site = canonicalizeSite(site);
-  if (! site)
+  if (! site) {
     return 1;
+  }
 
   var result = deployRpc({
     operation: 'info',
     site: site,
-    expectPayload: []
+    expectPayload: [],
+    printDeployURL: true
   });
   if (result.errorMessage) {
     Console.error("Couldn't get authorized users list: " + result.errorMessage);
@@ -613,48 +621,46 @@ var listAuthorized = function (site) {
   }
   var info = result.payload;
 
-  if (! _.has(info, 'protection')) {
+  if (! hasOwn.call(info, 'protection')) {
     Console.info("<anyone>");
     return 0;
   }
 
-  if (info.protection === "password") {
-    Console.info("<password>");
-    return 0;
-  }
-
   if (info.protection === "account") {
-    if (! _.has(info, 'authorized')) {
+    if (! hasOwn.call(info, 'authorized')) {
       Console.error("Couldn't get authorized users list: " +
                     "You are not authorized");
       return 1;
     }
 
-    Console.info((auth.loggedInUsername() || "<you>"));
-    _.each(info.authorized, function (username) {
-      if (username)
+    Console.info((loggedInUsername() || "<you>"));
+    info.authorized.forEach(username => {
+      if (username) {
         // Current username rules don't let you register anything that we might
         // want to split over multiple lines (ex: containing a space), but we
         // don't want confusion if we ever change some implementation detail.
         Console.rawInfo(username + "\n");
+      }
     });
     return 0;
   }
 };
 
-// action is "add" or "remove"
-var changeAuthorized = function (site, action, username) {
+// action is "add", "transfer" or "remove"
+export function changeAuthorized(site, action, username) {
   site = canonicalizeSite(site);
-  if (! site)
+  if (! site) {
     // canonicalizeSite will have already printed an error
     return 1;
+  }
 
   var result = authedRpc({
     method: 'POST',
     operation: 'authorized',
     site: site,
-    qs: action === "add" ? { add: username } : { remove: username },
-    promptIfAuthFails: true
+    qs: {[action]: username},
+    promptIfAuthFails: true,
+    printDeployURL: true
   });
 
   if (result.errorMessage) {
@@ -662,92 +668,16 @@ var changeAuthorized = function (site, action, username) {
     return 1;
   }
 
-  Console.info(site + ": " +
-               (action === "add" ? "added " : "removed ")
-                + username);
+  const verbs = {
+    add: "added",
+    remove: "removed",
+    transfer: "transferred"
+  };
+  Console.info(`${site}: ${verbs[action]} ${username}`);
   return 0;
 };
 
-var claim = function (site) {
-  site = canonicalizeSite(site);
-  if (! site)
-    // canonicalizeSite will have already printed an error
-    return 1;
-
-  // Check to see if it's even a claimable site, so that we can print
-  // a more appropriate message than we'd get if we called authedRpc
-  // straight away (at a cost of an extra REST call)
-  var infoResult = deployRpc({
-    operation: 'info',
-    site: site
-  });
-  if (infoResult.statusCode === 404) {
-    Console.error(
-      "There isn't a site deployed at that address. Use " +
-      Console.command("'meteor deploy'") + " " +
-      "if you'd like to deploy your app here.");
-    return 1;
-  }
-
-  if (infoResult.payload && infoResult.payload.protection === "account") {
-    if (infoResult.payload.authorized)
-      Console.error("That site already belongs to you.\n");
-    else
-      Console.error("Sorry, that site belongs to someone else.\n");
-    return 1;
-  }
-
-  if (infoResult.payload &&
-      infoResult.payload.protection === "password") {
-    Console.info(
-      "To claim this site and transfer it to your account, enter the",
-      "site password one last time.");
-    Console.info();
-  }
-
-  var result = authedRpc({
-    method: 'POST',
-    operation: 'claim',
-    site: site,
-    promptIfAuthFails: true
-  });
-
-  if (result.errorMessage) {
-    auth.pollForRegistrationCompletion();
-    if (! auth.loggedInUsername() &&
-        auth.registrationUrl()) {
-      Console.error(
-        "You need to set a password on your Meteor developer account before",
-        "you can claim sites. You can do that here in under a minute:");
-      Console.error(Console.url(auth.registrationUrl()));
-      Console.error();
-    } else {
-      Console.error("Couldn't claim site: " + result.errorMessage);
-    }
-    return 1;
-  }
-
-  Console.info(site + ": " + "successfully transferred to your account.");
-  Console.info();
-  Console.info("Show authorized users with:");
-  Console.info(
-    Console.command("meteor authorized " + site),
-    Console.options({ indent: 2 }));
-  Console.info();
-  Console.info("Add authorized users with:");
-  Console.info(
-    Console.command("meteor authorized " + site + " --add <username>"),
-    Console.options({ indent: 2 }));
-  Console.info();
-  Console.info("Remove authorized users with:");
-  Console.info(
-    Console.command("meteor authorized " + site + " --remove <username>"),
-    Console.options({ indent: 2 }));
-  Console.info();
-  return 0;
-};
-
-var listSites = function () {
+export function listSites() {
   var result = deployRpc({
     method: "GET",
     operation: "authorized-apps",
@@ -765,20 +695,86 @@ var listSites = function () {
       ! result.payload.sites.length) {
     Console.info("You don't have any sites yet.");
   } else {
-    result.payload.sites.sort();
-    _.each(result.payload.sites, function (site) {
-      Console.info(site);
-    });
+    result.payload.sites
+      .sort()
+      .forEach(site => Console.info(site));
   }
   return 0;
 };
 
+// Given a hostname, add "http://" or "https://" as
+// appropriate. (localhost gets http; anything else is always https.)
+function addScheme(hostOrURL) {
+  if (hostOrURL.match(/^http/)) {
+    return hostOrURL;
+  } else if (hostOrURL.match(/^localhost(:\d+)?$/)) {
+    return "http://" + hostOrURL;
+  } else {
+    return "https://" + hostOrURL;
+  }
+};
 
-exports.bundleAndDeploy = bundleAndDeploy;
-exports.deleteApp = deleteApp;
-exports.temporaryMongoUrl = temporaryMongoUrl;
-exports.logs = logs;
-exports.listAuthorized = listAuthorized;
-exports.changeAuthorized = changeAuthorized;
-exports.claim = claim;
-exports.listSites = listSites;
+// Maps from "site" to Promise<deploy URL>, so we don't have to re-ping on each
+// RPC (even if the calls to getDeployURL overlap).
+const galaxyDiscoveryCache = new Map;
+
+// getDeployURL returns the a Promise for the base deploy URL for the given app.
+// "app" may be falsey for certain RPCs (eg meteor list-sites).
+function getDeployURL(site) {
+  // Always trust explicitly configuration via env.
+  if (process.env.DEPLOY_HOSTNAME) {
+    return Promise.resolve(addScheme(process.env.DEPLOY_HOSTNAME.trim()));
+  }
+
+  const defaultURL = "https://us-east-1.galaxy-deploy.meteor.com";
+
+  // No site? Just use the default.
+  if (!site) {
+    return Promise.resolve(defaultURL);
+  }
+
+  // If we have a site, we can try to do Galaxy discovery.
+
+  // Do we already have an answer?
+  if (galaxyDiscoveryCache.has(site)) {
+    return galaxyDiscoveryCache.get(site);
+  }
+
+  // Otherwise, try https first, then http, then just use the default.
+  const p = discoverGalaxy(site, "https")
+          .catch(() => discoverGalaxy(site, "http"))
+          .catch(() => defaultURL);
+  galaxyDiscoveryCache.set(site, p);
+  return p;
+}
+
+// discoverGalaxy returns the URL to use for Galaxy discovery, or an error if it
+// couldn't be fetched.
+async function discoverGalaxy(site, scheme) {
+  const discoveryURL =
+          scheme + "://" + site + "/.well-known/meteor/deploy-url";
+  // If httpHelpers.request throws, the returned Promise will reject, which is
+  // fine.
+  const { response, body } = request({
+    url: discoveryURL,
+    json: true,
+    strictSSL: true,
+    // We don't want to be confused by, eg, a non-Galaxy-hosted site which
+    // redirects to a Galaxy-hosted site.
+    followRedirect: false
+  });
+  if (response.statusCode !== 200) {
+    throw new Error("bad status code: " + response.statusCode);
+  }
+  if (!body) {
+    throw new Error("response had no body");
+  }
+  if (body.galaxyDiscoveryVersion !== "galaxy-1") {
+    throw new Error(
+      "unexpected galaxyDiscoveryVersion: " + body.galaxyDiscoveryVersion);
+  }
+  if (! hasOwn.call(body, "deployURL")) {
+    throw new Error("no deployURL");
+  }
+  return body.deployURL;
+}

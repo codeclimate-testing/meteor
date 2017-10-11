@@ -12,9 +12,10 @@ var MONGO_LISTENING =
 function startRun(sandbox) {
   var run = sandbox.run();
   run.match("myapp");
-  run.match("proxy");
+  run.matchBeforeExit("Started proxy");
   run.tellMongo(MONGO_LISTENING);
-  run.match("MongoDB");
+  run.matchBeforeExit("Started MongoDB");
+  run.waitSecs(15);
   return run;
 };
 
@@ -103,12 +104,18 @@ selftest.define("compiler plugin caching - coffee", () => {
     });
 
     // First program built (web.browser) compiles everything.
-    cacheMatch('Ran (#1) on: ' + JSON.stringify(
-      ["/subdir/nested-root." + extension, "/top." + extension]));
+    cacheMatch('Ran (#1) on: ' + JSON.stringify([
+      // Though files in imports directories are compiled, they are marked
+      // as lazy so they will not be loaded unless imported.
+      "/imports/dotdot." + extension,
+      "/subdir/nested-root." + extension,
+      "/top." + extension
+    ]));
     // There is no render execution in the server program, because it has
     // archMatching:'web'.  We'll see this more clearly when the next call later
     // is "#2" --- we didn't miss a call!
     // App prints this:
+    run.waitSecs(15);
     run.match("Hello world");
 
     // Check that the CSS is what we expect.
@@ -137,6 +144,7 @@ selftest.define("compiler plugin caching - coffee", () => {
     // preprocessor file in it. This should not require us to render anything.
     s.append("packages/local-pack/package.js", "\n// foo\n");
     cacheMatch('Ran (#2) on: []');
+    run.waitSecs(15);
     run.match("Hello world");
 
     function setVariable(variableName, value) {
@@ -199,6 +207,7 @@ selftest.define("compiler plugin caching - coffee", () => {
     cacheMatch('Loaded {}/top.' + extension);
     cacheMatch('Loaded {}/yet-another-root.' + extension);
     cacheMatch(`Ran (#1) on: ["/top.${ extension }"]`);
+    run.waitSecs(15);
     run.match('Hello world');
     checkCSS(expectedBorderStyles);
 
@@ -282,6 +291,7 @@ selftest.define("compiler plugins - duplicate extension", () => {
   s.write('packages/local-plugin/plugin.js',
           s.read('packages/local-plugin/plugin.js').replace('myext', 'xext'));
   run.match('Modified -- restarting');
+  run.waitSecs(30);
 
   run.stop();
 });
@@ -302,11 +312,12 @@ selftest.define("compiler plugins - inactive source", () => {
   s.createApp('myapp', 'uses-published-package-with-inactive-source');
   s.cd('myapp');
 
-  let run = startRun(s);
+  const run = s.run();
+  run.match('myapp');
+  run.matchBeforeExit('Started proxy');
   run.match('Errors prevented startup');
   run.match('no plugin found for foo.sourcish in glasser:use-sourcish');
   run.match('none is now');
-
   run.stop();
 });
 
@@ -324,8 +335,9 @@ selftest.define("compiler plugins - compiler throws", () => {
   // XXX This is wrong! The path on disk is packages/local-plugin/plugin.js, but
   // at some point we switched to the servePath which is based on the *plugin*'s
   // "package" name.
-  run.matchErr('packages/compilePrintme/plugin.js:5:1: Error in my ' +
-               'registerCompiler callback!');
+  run.matchErr(
+    /packages\/compilePrintme_plugin\.js:\d+:\d+: Error in my registerCompiler callback!/
+  );
   run.expectExit(1);
 });
 
@@ -364,60 +376,70 @@ selftest.define("compiler plugins - addAssets", () => {
   run.match("Printing out my own source code!");
 
   // Test client-side asset.
-  const body = getUrl('http://localhost:3000/packages/' +
+  let body = getUrl('http://localhost:3000/packages/' +
+    'asset-and-source/asset-and-source.js');
+  selftest.expectTrue(body.indexOf('Printing out my own source code!') !== -1);
+
+  // Test that deprecated API still works (added in 1.2.1 in response to people
+  // having trouble upgrading to 1.2)
+  s.write("packages/asset-and-source/package.js", `Package.describe({
+      name: 'asset-and-source',
+      version: '0.0.1'
+    });
+
+    Package.onUse(function(api) {
+      api.addFiles('asset-and-source.js');
+      api.addFiles('asset-and-source.js',
+        ['client', 'server'], { isAsset: true });
+    });
+  `);
+
+  // Test server-side asset.
+  run.match("Printing out my own source code!");
+
+  // Test client-side asset.
+  body = getUrl('http://localhost:3000/packages/' +
     'asset-and-source/asset-and-source.js');
   selftest.expectTrue(body.indexOf('Printing out my own source code!') !== -1);
 
   // Test error messages for malformed package files
   s.write("packages/asset-and-source/package.js", `Package.describe({
-    name: 'asset-and-source',
-    version: '0.0.1'
-  });
+      name: 'asset-and-source',
+      version: '0.0.1'
+    });
 
-  Package.onUse(function(api) {
-    api.addFiles('asset-and-source.js');
-    api.addAssets('asset-and-source.js', ['client', 'server']);
-    api.addFiles('asset-and-source.js');
-  });
-`);
+    Package.onUse(function(api) {
+      api.addFiles('asset-and-source.js');
+      api.addAssets('asset-and-source.js', ['client', 'server']);
+      api.addFiles('asset-and-source.js');
+    });
+  `);
 
   run.match(/Duplicate source file/);
 
   s.write("packages/asset-and-source/package.js", `Package.describe({
-    name: 'asset-and-source',
-    version: '0.0.1'
-  });
+      name: 'asset-and-source',
+      version: '0.0.1'
+    });
 
-  Package.onUse(function(api) {
-    api.addFiles('asset-and-source.js');
-    api.addAssets('asset-and-source.js', ['client', 'server']);
-    api.addAssets('asset-and-source.js', ['client', 'server']);
-  });
-`);
+    Package.onUse(function(api) {
+      api.addFiles('asset-and-source.js');
+      api.addAssets('asset-and-source.js', ['client', 'server']);
+      api.addAssets('asset-and-source.js', ['client', 'server']);
+    });
+  `);
 
   run.match(/Duplicate asset file/);
 
   s.write("packages/asset-and-source/package.js", `Package.describe({
-    name: 'asset-and-source',
-    version: '0.0.1'
-  });
+      name: 'asset-and-source',
+      version: '0.0.1'
+    });
 
-  Package.onUse(function(api) {
-    api.addFiles('asset-and-source.js', 'client', { isAsset: true });
-  });
+    Package.onUse(function(api) {
+      api.addAssets('asset-and-source.js');
+    });
   `);
-
-  run.match(/deprecated/);
-
-  s.write("packages/asset-and-source/package.js", `Package.describe({
-    name: 'asset-and-source',
-    version: '0.0.1'
-  });
-
-  Package.onUse(function(api) {
-    api.addAssets('asset-and-source.js');
-  });
-`);
 
   run.match(/requires a second argument/);
 

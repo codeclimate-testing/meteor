@@ -101,6 +101,13 @@ Tinytest.add("tracker - nested run", function (test) {
 
   expect('abcdef');
 
+  test.isTrue(a.hasDependents());
+  test.isTrue(b.hasDependents());
+  test.isTrue(c.hasDependents());
+  test.isTrue(d.hasDependents());
+  test.isTrue(e.hasDependents());
+  test.isTrue(f.hasDependents());
+
   b.changed();
   expect(''); // didn't flush yet
   Tracker.flush();
@@ -124,6 +131,14 @@ Tinytest.add("tracker - nested run", function (test) {
   // no more running!
   changeAndExpect(e, '');
   changeAndExpect(f, '');
+
+  test.isTrue(a.hasDependents());
+  test.isTrue(b.hasDependents());
+  test.isTrue(c.hasDependents());
+  test.isFalse(d.hasDependents());
+  test.isFalse(e.hasDependents());
+  test.isFalse(f.hasDependents());
+
   // rerun C
   changeAndExpect(c, 'cdef');
   changeAndExpect(e, 'ef');
@@ -132,6 +147,14 @@ Tinytest.add("tracker - nested run", function (test) {
   changeAndExpect(b, 'bcdef');
   changeAndExpect(e, 'ef');
   changeAndExpect(f, 'f');
+
+  test.isTrue(a.hasDependents());
+  test.isTrue(b.hasDependents());
+  test.isTrue(c.hasDependents());
+  test.isTrue(d.hasDependents());
+  test.isTrue(e.hasDependents());
+  test.isTrue(f.hasDependents());
+
   // kill A
   a.changed();
   changeAndExpect(f, '');
@@ -495,3 +518,51 @@ testAsyncMulti('tracker - Tracker.autorun, onError option', [function (test, exp
   Tracker.flush();
 }]);
 
+Tinytest.add('computation - #flush', function (test) {
+  var i = 0, j = 0, d = new Tracker.Dependency;
+  var c1 = Tracker.autorun(function () {
+    d.depend();
+    i = i + 1;
+  });
+  var c2 = Tracker.autorun(function () {
+    d.depend();
+    j = j + 1;
+  });
+  test.equal(i,1);
+  test.equal(j,1);
+
+  d.changed();
+  c1.flush();
+  test.equal(i, 2);
+  test.equal(j, 1);
+
+  Tracker.flush();
+  test.equal(i, 2);
+  test.equal(j, 2);
+});
+
+Tinytest.add('computation - #run', function (test) {
+  var i = 0, d = new Tracker.Dependency, d2 = new Tracker.Dependency;
+  var computation = Tracker.autorun(function (c) {
+    d.depend();
+    i = i + 1;
+    //when #run() is called, this dependency should be picked up
+    if (i>=2 && i<4) { d2.depend(); }
+  });
+  test.equal(i,1);
+  computation.run();
+  test.equal(i,2);
+
+  d.changed(); Tracker.flush();
+  test.equal(i,3);
+
+  //we expect to depend on d2 at this point
+  d2.changed(); Tracker.flush();
+  test.equal(i,4);
+
+  //we no longer depend on d2, only d
+  d2.changed(); Tracker.flush();
+  test.equal(i,4);
+  d.changed(); Tracker.flush();
+  test.equal(i,5);
+});

@@ -1,29 +1,15 @@
-var meteorBabel = Npm.require('meteor-babel');
-
-function validateExtraFeatures(extraFeatures) {
-  if (extraFeatures) {
-    check(extraFeatures, {
-      // Modify options to enable ES2015 module syntax.
-      modules: Match.Optional(Boolean),
-      // Modify options to enable async/await syntax powered by Fibers.
-      meteorAsyncAwait: Match.Optional(Boolean),
-      // Modify options to enable React/JSX syntax.
-      react: Match.Optional(Boolean),
-      // Improve compatibility in older versions of Internet Explorer.
-      jscript: Match.Optional(Boolean)
-    });
-  }
+var meteorBabel = null;
+function getMeteorBabel() {
+  return meteorBabel || (meteorBabel = Npm.require("meteor-babel"));
 }
 
 /**
  * Returns a new object containing default options appropriate for
  */
 function getDefaultOptions(extraFeatures) {
-  validateExtraFeatures(extraFeatures);
-
   // See https://github.com/meteor/babel/blob/master/options.js for more
   // information about what the default options are.
-  var options = meteorBabel.getDefaultOptions(extraFeatures);
+  var options = getMeteorBabel().getDefaultOptions(extraFeatures);
 
   // The sourceMap option should probably be removed from the default
   // options returned by meteorBabel.getDefaultOptions.
@@ -35,37 +21,28 @@ function getDefaultOptions(extraFeatures) {
 Babel = {
   getDefaultOptions: getDefaultOptions,
 
-  validateExtraFeatures: validateExtraFeatures,
+  // Deprecated, now a no-op.
+  validateExtraFeatures: Function.prototype,
+
+  parse: function (source) {
+    return getMeteorBabel().parse(source);
+  },
 
   compile: function (source, options) {
     options = options || getDefaultOptions();
-    return meteorBabel.compile(source, options);
-  },
-
-  // Provided for backwards compatibility; prefer Babel.compile.
-  transformMeteor: function (source, extraOptions) {
-    var options = getDefaultOptions();
-
-    if (extraOptions) {
-      if (extraOptions.extraWhitelist) {
-        options.whitelist.push.apply(
-          options.whitelist,
-          extraOptions.extraWhitelist
-        );
-      }
-
-      for (var key in extraOptions) {
-        if (key !== "extraWhitelist" &&
-            hasOwnProperty.call(extraOptions, key)) {
-          options[key] = extraOptions[key];
-        }
-      }
-    }
-
-    return meteorBabel.compile(source, options);
+    return getMeteorBabel().compile(source, options);
   },
 
   setCacheDir: function (cacheDir) {
-    meteorBabel.setCacheDir(cacheDir);
+    getMeteorBabel().setCacheDir(cacheDir);
+  },
+
+  minify: function (source, options) {
+    var options = options || getMeteorBabel().getMinifierOptions();
+    return getMeteorBabel().minify(source, options);
+  },
+
+  getMinifierOptions: function (extraFeatures) {
+    return getMeteorBabel().getMinifierOptions(extraFeatures);
   }
 };

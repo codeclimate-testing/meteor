@@ -1,4 +1,6 @@
 # Minimongo
+[Source code of released version](https://github.com/meteor/meteor/tree/master/packages/minimongo) | [Source code of development version](https://github.com/meteor/meteor/tree/devel/packages/minimongo)
+***
 
 `minimongo` is reimplementation of (almost) the entire MongoDB API, against an
 in-memory JavaScript database. It is like a MongoDB emulator that runs inside
@@ -49,6 +51,8 @@ a query changes
   * can the sort order change after applying this modifier (for a given
   selector)
   * what is a combined projection for these selector, sorter and projection
+- `find` accepts a literal function instead of a selector, and a comparison
+  function for sorting
 
 
 ### saveOriginals/retrieveOriginals & pauseObserver/resumeObservers

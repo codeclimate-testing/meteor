@@ -28,7 +28,8 @@ PollingObserveDriver = function (options) {
   // Make sure to create a separately throttled function for each
   // PollingObserveDriver object.
   self._ensurePollIsScheduled = _.throttle(
-    self._unthrottledEnsurePollIsScheduled, 50 /* ms */);
+    self._unthrottledEnsurePollIsScheduled,
+    self._cursorDescription.options.pollingThrottleMs || 50 /* ms */);
 
   // XXX figure out if we still need a queue
   self._taskQueue = new Meteor._SynchronousQueue();
@@ -43,7 +44,7 @@ PollingObserveDriver = function (options) {
         self._pendingWrites.push(fence.beginWrite());
       // Ensure a poll is scheduled... but if we already know that one is,
       // don't hit the throttled _ensurePollIsScheduled function (which might
-      // lead to us calling it unnecessarily in 50ms).
+      // lead to us calling it unnecessarily in <pollingThrottleMs> ms).
       if (self._pollsScheduledButNotStarted === 0)
         self._ensurePollIsScheduled();
     }
@@ -60,8 +61,12 @@ PollingObserveDriver = function (options) {
   if (options._testOnlyPollCallback) {
     self._testOnlyPollCallback = options._testOnlyPollCallback;
   } else {
+    var pollingInterval =
+          self._cursorDescription.options.pollingIntervalMs ||
+          self._cursorDescription.options._pollingInterval || // COMPAT with 1.2
+          10 * 1000;
     var intervalHandle = Meteor.setInterval(
-      _.bind(self._ensurePollIsScheduled, self), 10 * 1000);
+      _.bind(self._ensurePollIsScheduled, self), pollingInterval);
     self._stopCallbacks.push(function () {
       Meteor.clearInterval(intervalHandle);
     });
@@ -129,6 +134,7 @@ _.extend(PollingObserveDriver.prototype, {
       return;
 
     var first = false;
+    var newResults;
     var oldResults = self._results;
     if (!oldResults) {
       first = true;
@@ -144,7 +150,7 @@ _.extend(PollingObserveDriver.prototype, {
 
     // Get the new query results. (This yields.)
     try {
-      var newResults = self._synchronousCursor.getRawObjects(self._ordered);
+      newResults = self._synchronousCursor.getRawObjects(self._ordered);
     } catch (e) {
       if (first && typeof(e.code) === 'number') {
         // This is an error document sent to us by mongod, not a connection

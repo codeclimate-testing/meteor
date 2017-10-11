@@ -1,27 +1,14 @@
 Package.describe({
   name: "ecmascript-runtime",
-  version: "0.2.6",
+  version: "0.4.1",
   summary: "Polyfills for new ECMAScript 2015 APIs like Map and Set",
   git: "https://github.com/meteor/ecmascript-runtime",
   documentation: "README.md"
 });
 
-Npm.depends({
-  "meteor-ecmascript-runtime": "0.2.6"
-});
-
 Package.onUse(function(api) {
-  api.addFiles("runtime.js", "server");
-
-  api.addFiles(
-    ".npm/package/node_modules/meteor-ecmascript-runtime/client.js",
-    "client",
-    { bare: true }
-  );
-
-  api.export("Symbol");
-  api.export("Map");
-  api.export("Set");
+  api.imply("ecmascript-runtime-client", "client");
+  api.imply("ecmascript-runtime-server", "server");
 });
 
 Package.onTest(function(api) {

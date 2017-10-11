@@ -1,8 +1,14 @@
-var newConnection = function (stream) {
+import lolex from 'lolex';
+import { DDP, LivedataTest } from "./namespace.js";
+
+var newConnection = function (stream, options) {
   // Some of these tests leave outstanding methods with no result yet
   // returned. This should not block us from re-running tests when sources
   // change.
-  return new LivedataTest.Connection(stream, {reloadWithOutstanding: true});
+  return new LivedataTest.Connection(stream, _.extend({
+    reloadWithOutstanding: true,
+    bufferedWritesInterval: 0
+  }, options));
 };
 
 var makeConnectMessage = function (session) {
@@ -15,7 +21,7 @@ var makeConnectMessage = function (session) {
   if (session)
     msg.session = session;
   return msg;
-}
+};
 
 // Tests that stream got a message that matches expected.
 // Expected is normally an object, and allows a wildcard value of '*',
@@ -90,6 +96,70 @@ Tinytest.add("livedata stub - receive data", function (test) {
                   fields: {a:2}});
   test.equal(coll.find({}).fetch(), [{_id:'1234', a:2}]);
   test.isUndefined(conn._updatesForUnknownStores[coll_name]);
+});
+
+Tinytest.add("livedata stub - buffering data", function (test) {
+  // Install special setTimeout that allows tick-by-tick control in tests using sinonjs 'lolex'
+  // This needs to be before the connection is instantiated.
+  const clock = lolex.install();
+  const tick = (timeout) => clock.tick(timeout);
+
+  const stream = new StubStream();
+  const conn = newConnection(stream, {
+    bufferedWritesInterval: 10,
+    bufferedWritesMaxAge: 40,
+  });
+
+  startAndConnect(test, stream);
+
+  const coll_name = Random.id();
+  const coll = new Mongo.Collection(coll_name, conn);
+
+  const testDocCount = (count) => test.equal(coll.find({}).count(), count);
+
+  const addDoc = () => {
+    stream.receive({
+      msg: 'added',
+      collection: coll_name,
+      id: Random.id(),
+      fields: {}
+    });
+  };
+
+  // Starting at 0 ticks.  At this point we haven't advanced the fake clock at all.
+
+  addDoc(); // 1st Doc
+  testDocCount(0);  // No doc been recognized yet because it's buffered, waiting for more.
+  tick(6); // 6 total ticks
+  testDocCount(0); // Ensure that the doc still hasn't shown up, despite the clock moving forward.
+  tick(4) // 10 total ticks, 1st buffer interval
+  testDocCount(1); // No other docs have arrived, so we 'see' the 1st doc.
+
+  addDoc(); // 2nd doc
+  tick(1); // 11 total ticks (1 since last flush)
+  testDocCount(1); // Again, second doc hasn't arrived because we're waiting for more...
+  tick(9); // 20 total ticks (10 ticks since last flush & the 2nd 10-tick interval)
+  testDocCount(2); // Now we're here and got the second document.
+
+  // Add several docs, frequently enough that we buffer multiple times before the next flush.
+  addDoc(); // 3 docs
+  tick(6); // 26 ticks (6 since last flush)
+  addDoc(); // 4 docs
+  tick(6); // 32 ticks (12 since last flush)
+  addDoc(); // 5 docs
+  tick(6); // 38 ticks (18 since last flush)
+  addDoc(); // 6 docs
+  tick(6); // 44 ticks (24 since last flush)
+  addDoc(); // 7 docs
+  tick(9); // 53 ticks (33 since last flush)
+  addDoc(); // 8 docs
+  tick(9); // 62 ticks! (42 ticks since last flush, over max-age - next interval triggers flush)
+  testDocCount(2); // Still at 2 from before! (Just making sure)
+  tick(1); // Ok, 63 ticks (10 since last doc, so this should cause the flush of all the docs)
+  testDocCount(8); // See all the docs.
+
+  // Put things back how they were.
+  clock.uninstall();
 });
 
 Tinytest.add("livedata stub - subscribe", function (test) {
@@ -221,9 +291,9 @@ Tinytest.add("livedata stub - reactive subscribe", function (test) {
 
   // Change the foo subscription and flush. We should sub to the new foo
   // subscription, re-sub to the stopper subscription, and then unsub from the old
-  // foo subscription.  The bar subscription should be unaffected. The completer
-  // subscription should *NOT* call its new onReady callback, because we only
-  // call at most one onReady for a given reactively-saved subscription.
+  // foo subscription. The bar subscription should be unaffected. The completer
+  // subscription should call its new onReady callback, because we always
+  // call onReady for a given reactively-saved subscription.
   // The completerHandle should have been reestablished to the ready handle.
   rFoo.set("foo2");
   Tracker.flush();
@@ -242,17 +312,17 @@ Tinytest.add("livedata stub - reactive subscribe", function (test) {
   message = JSON.parse(stream.sent.shift());
   test.equal(message, {msg: 'unsub', id: idFoo1});
 
-  test.equal(onReadyCount, {completer: 1});
+  test.equal(onReadyCount, {completer: 2});
   test.isTrue(completerReady);
 
   // Ready the stopper and bar subs. Completing stopper should call only the
   // onReady from the new subscription because they were separate subscriptions
   // started at different times and the first one was explicitly torn down by
-  // the client; completing bar should call only the onReady from the new
-  // subscription because we only call at most one onReady per reactively-saved
+  // the client; completing bar should call the onReady from the new
+  // subscription because we always call onReady for a given reactively-saved
   // subscription.
   stream.receive({msg: 'ready', 'subs': [idStopperAgain, idBar1]});
-  test.equal(onReadyCount, {completer: 1, bar1: 1, stopper: 1});
+  test.equal(onReadyCount, {completer: 2, bar1: 1, stopper: 1});
 
   // Shut down the autorun. This should unsub us from all current subs at flush
   // time.
@@ -742,9 +812,87 @@ Tinytest.add("livedata stub - reconnect", function (test) {
   o.stop();
 });
 
+if (Meteor.isClient) {
+  Tinytest.add("livedata stub - reconnect non-idempotent method", function(test) {
+    // This test is for https://github.com/meteor/meteor/issues/6108
+    var stream = new StubStream();
+    var conn = newConnection(stream);
+
+    startAndConnect(test, stream);
+
+    var firstMethodCallbackFired = false;
+    var firstMethodCallbackErrored = false;
+    var secondMethodCallbackFired = false;
+    var secondMethodCallbackErrored = false;
+
+    // call with noRetry true so that the method should fail to retry on reconnect.
+    conn.apply('do_something', [], {noRetry: true}, function(error) {
+      firstMethodCallbackFired = true;
+      // failure on reconnect should trigger an error.
+      if (error && error.error === 'invocation-failed') {
+        firstMethodCallbackErrored = true;
+      }
+    });
+    conn.apply('do_something_else', [], {noRetry: true}, function(error) {
+      secondMethodCallbackFired = true;
+      // failure on reconnect should trigger an error.
+      if (error && error.error === 'invocation-failed') {
+        secondMethodCallbackErrored = true;
+      }
+    });
+
+    // The method has not succeeded yet
+    test.isFalse(firstMethodCallbackFired);
+    test.isFalse(secondMethodCallbackFired);
+
+    // send the methods
+    stream.sent.shift();
+    stream.sent.shift();
+    // reconnect
+    stream.reset();
+
+    // verify that a reconnect message was sent.
+    testGotMessage(test, stream, makeConnectMessage(SESSION_ID));
+    // Make sure that the stream triggers connection.
+    stream.receive({msg: 'connected', session: SESSION_ID + 1});
+
+    //The method callback should fire even though the stream has not sent a response.
+    //the callback should have been fired with an error.
+    test.isTrue(firstMethodCallbackFired);
+    test.isTrue(firstMethodCallbackErrored);
+    test.isTrue(secondMethodCallbackFired);
+    test.isTrue(secondMethodCallbackErrored);
+
+    // verify that the method message was not sent.
+    test.isUndefined(stream.sent.shift());
+  });
+}
+
+function addReconnectTests(name, testFunc) {
+  Tinytest.add(name + " (deprecated)", function (test) {
+    function deprecatedSetOnReconnect(conn, handler) {
+      conn.onReconnect = handler;
+    }
+    testFunc.call(this, test, deprecatedSetOnReconnect);
+  });
+
+  Tinytest.add(name, function (test) {
+    var stopper;
+    function setOnReconnect(conn, handler) {
+      stopper && stopper.stop();
+      stopper = DDP.onReconnect(function (reconnectingConn) {
+        if (reconnectingConn === conn) {
+          handler();
+        }
+      });
+    }
+    testFunc.call(this, test, setOnReconnect);
+    stopper && stopper.stop();
+  });
+}
 
 if (Meteor.isClient) {
-  Tinytest.add("livedata stub - reconnect method which only got result", function (test) {
+  addReconnectTests("livedata stub - reconnect method which only got result", function (test, setOnReconnect) {
     var stream = new StubStream;
     var conn = newConnection(stream);
     startAndConnect(test, stream);
@@ -867,11 +1015,11 @@ if (Meteor.isClient) {
     // Callback not called, but onResultReceived is.
     test.equal(callbackOutput, ['bla']);
     test.equal(onResultReceivedOutput, ['bla', 'blab']);
-    conn.onReconnect = function () {
+    setOnReconnect(conn, function () {
       conn.call('slowMethod', function (err, result) {
         callbackOutput.push(result);
       });
-    };
+    });
 
     // Reset stream. Method does NOT get resent, because its result is already in,
     // but slowMethod gets called via onReconnect. Reconnect quiescence is now
@@ -1185,15 +1333,24 @@ Tinytest.add("livedata stub - reactive resub", function (test) {
   });
 
   markAllReady();
+  var message = JSON.parse(stream.sent.shift());
+  delete message.id;
+  test.equal(message, {msg: 'sub', name: 'foo-sub', params: ['A']});
   test.equal(fooReady, 1);
 
   // Rerun the inner autorun with different subscription
-  // arguments.  Detect the re-sub via onReady.
+  // arguments.
   fooArg.set('B');
   test.isTrue(inner.invalidated);
   Tracker.flush();
   test.isFalse(inner.invalidated);
   markAllReady();
+  message = JSON.parse(stream.sent.shift());
+  delete message.id;
+  test.equal(message, {msg: 'sub', name: 'foo-sub', params: ['B']});
+  message = JSON.parse(stream.sent.shift());
+  delete message.id;
+  test.equal(message, {msg: 'unsub'});
   test.equal(fooReady, 2);
 
   // Rerun inner again with same args; should be no re-sub.
@@ -1202,7 +1359,8 @@ Tinytest.add("livedata stub - reactive resub", function (test) {
   Tracker.flush();
   test.isFalse(inner.invalidated);
   markAllReady();
-  test.equal(fooReady, 2);
+  test.isUndefined(stream.sent.shift());  test.isUndefined(stream.sent.shift());
+  test.equal(fooReady, 3);
 
   // Rerun outer!  Should still be no re-sub even though
   // the inner computation is stopped and a new one is
@@ -1212,13 +1370,20 @@ Tinytest.add("livedata stub - reactive resub", function (test) {
   Tracker.flush();
   test.isFalse(inner.invalidated);
   markAllReady();
-  test.equal(fooReady, 2);
+  test.isUndefined(stream.sent.shift());
+  test.equal(fooReady, 4);
 
   // Change the subscription.  Now we should get an onReady.
   fooArg.set('C');
   Tracker.flush();
   markAllReady();
-  test.equal(fooReady, 3);
+  message = JSON.parse(stream.sent.shift());
+  delete message.id;
+  test.equal(message, {msg: 'sub', name: 'foo-sub', params: ['C']});
+  message = JSON.parse(stream.sent.shift());
+  delete message.id;
+  test.equal(message, {msg: 'unsub'});
+  test.equal(fooReady, 5);
 });
 
 
@@ -1343,7 +1508,7 @@ Tinytest.add("livedata connection - two wait methods", function (test) {
   test.equal(six_message.params, ['six!']);
 });
 
-Tinytest.add("livedata connection - onReconnect prepends messages correctly with a wait method", function(test) {
+addReconnectTests("livedata connection - onReconnect prepends messages correctly with a wait method", function(test, setOnReconnect) {
   var stream = new StubStream();
   var conn = newConnection(stream);
   startAndConnect(test, stream);
@@ -1351,12 +1516,12 @@ Tinytest.add("livedata connection - onReconnect prepends messages correctly with
   // setup method
   conn.methods({do_something: function (x) {}});
 
-  conn.onReconnect = function() {
+  setOnReconnect(conn, function() {
     conn.apply('do_something', ['reconnect zero'], _.identity);
     conn.apply('do_something', ['reconnect one'], _.identity);
     conn.apply('do_something', ['reconnect two'], {wait: true}, _.identity);
     conn.apply('do_something', ['reconnect three'], _.identity);
-  };
+  });
 
   conn.apply('do_something', ['one'], _.identity);
   conn.apply('do_something', ['two'], {wait: true}, _.identity);
@@ -1523,7 +1688,7 @@ Tinytest.addAsync("livedata connection - version negotiation error",
   });
 });
 
-Tinytest.add("livedata connection - onReconnect prepends messages correctly without a wait method", function(test) {
+addReconnectTests("livedata connection - onReconnect prepends messages correctly without a wait method", function(test, setOnReconnect) {
   var stream = new StubStream();
   var conn = newConnection(stream);
   startAndConnect(test, stream);
@@ -1531,11 +1696,11 @@ Tinytest.add("livedata connection - onReconnect prepends messages correctly with
   // setup method
   conn.methods({do_something: function (x) {}});
 
-  conn.onReconnect = function() {
+  setOnReconnect(conn, function() {
     conn.apply('do_something', ['reconnect one'], _.identity);
     conn.apply('do_something', ['reconnect two'], _.identity);
     conn.apply('do_something', ['reconnect three'], _.identity);
-  };
+  });
 
   conn.apply('do_something', ['one'], _.identity);
   conn.apply('do_something', ['two'], {wait: true}, _.identity);
@@ -1567,7 +1732,7 @@ Tinytest.add("livedata connection - onReconnect prepends messages correctly with
   ]);
 });
 
-Tinytest.add("livedata connection - onReconnect with sent messages", function(test) {
+addReconnectTests("livedata connection - onReconnect with sent messages", function(test, setOnReconnect) {
   var stream = new StubStream();
   var conn = newConnection(stream);
   startAndConnect(test, stream);
@@ -1575,9 +1740,9 @@ Tinytest.add("livedata connection - onReconnect with sent messages", function(te
   // setup method
   conn.methods({do_something: function (x) {}});
 
-  conn.onReconnect = function() {
+  setOnReconnect(conn, function() {
     conn.apply('do_something', ['login'], {wait: true}, _.identity);
-  };
+  });
 
   conn.apply('do_something', ['one'], _.identity);
 
@@ -1610,17 +1775,17 @@ Tinytest.add("livedata connection - onReconnect with sent messages", function(te
 
 
 
-Tinytest.add("livedata stub - reconnect double wait method", function (test) {
+addReconnectTests("livedata stub - reconnect double wait method", function (test, setOnReconnect) {
   var stream = new StubStream;
   var conn = newConnection(stream);
   startAndConnect(test, stream);
 
   var output = [];
-  conn.onReconnect = function () {
+  setOnReconnect(conn, function () {
     conn.apply('reconnectMethod', [], {wait: true}, function (err, result) {
       output.push('reconnect');
     });
-  };
+  });
 
   conn.apply('halfwayMethod', [], {wait: true}, function (err, result) {
     output.push('halfway');
@@ -1870,6 +2035,82 @@ if (Meteor.isClient) {
 
     // Server wrote a different value, make sure it's visible now.
     test.isTrue(coll.findOne('aaa').value == 333);
+  });
+
+  Tinytest.add("livedata stub - buffering and methods interaction", function (test) {
+    var stream = new StubStream();
+    var conn = newConnection(stream, {
+      // A very high values so that all messages are effectively buffered.
+      bufferedWritesInterval: 10000,
+      bufferedWritesMaxAge: 10000
+    });
+
+    startAndConnect(test, stream);
+
+    var collName = Random.id();
+    var coll = new Mongo.Collection(collName, {connection: conn});
+
+    conn.methods({
+      update_value: function () {
+        const value = coll.findOne('aaa').subscription;
+        // Method should have access to the latest value of the collection.
+        coll.update('aaa', {$set: {method: value + 110}});
+      }
+    });
+
+    // Set up test subscription.
+    var sub = conn.subscribe('test_data');
+    var subMessage = JSON.parse(stream.sent.shift());
+    test.equal(subMessage, {msg: 'sub', name: 'test_data',
+                            params: [], id:subMessage.id});
+    test.length(stream.sent, 0);
+
+    var subDocMessage = {msg: 'added', collection: collName,
+                         id: 'aaa', fields: {subscription: 111}};
+
+    var subReadyMessage = {msg: 'ready', 'subs': [subMessage.id]};
+
+    stream.receive(subDocMessage);
+    stream.receive(subReadyMessage);
+    test.equal(coll.findOne('aaa').subscription, 111);
+
+    var subDocChangeMessage = {msg: 'changed', collection: collName,
+                               id: 'aaa', fields: {subscription: 112}};
+
+    stream.receive(subDocChangeMessage);
+    // Still 111 because buffer has not been flushed.
+    test.equal(coll.findOne('aaa').subscription, 111);
+
+    // Call updates the stub.
+    conn.call('update_value');
+
+    // Observe the stub-written value.
+    test.equal(coll.findOne('aaa').method, 222);
+    // subscription field is updated to the latest value
+    // because of the method call.
+    test.equal(coll.findOne('aaa').subscription, 112);
+
+    var methodMessage = JSON.parse(stream.sent.shift());
+    test.equal(methodMessage, {msg: 'method', method: 'update_value',
+                               params: [], id:methodMessage.id});
+    test.length(stream.sent, 0);
+
+    // "Server-side" change from the method arrives and method returns.
+    // With potentially fixed value for method field, if stub didn't
+    // use 112 as the subscription field value.
+    stream.receive({msg: 'changed', collection: collName,
+                         id: 'aaa', fields: {method: 222}});
+    stream.receive({msg: 'updated', 'methods': [methodMessage.id]});
+    stream.receive({msg: 'result', id:methodMessage.id, result:null});
+
+    test.equal(coll.findOne('aaa').method, 222);
+    test.equal(coll.findOne('aaa').subscription, 112);
+
+    // Buffer should already be flushed because of a non-update message.
+    // And after a flush we really want subscription field to be 112.
+    conn._flushBufferedWrites();
+    test.equal(coll.findOne('aaa').method, 222);
+    test.equal(coll.findOne('aaa').subscription, 112);
   });
 }
 

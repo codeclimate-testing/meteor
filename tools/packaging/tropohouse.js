@@ -23,8 +23,9 @@ exports.Tropohouse = function (root, options) {
 // we are running form a checkout, probably at $CHECKOUT_DIR/.meteor.
 var defaultWarehouseDir = function () {
   // a hook for tests, or i guess for users.
-  if (process.env.METEOR_WAREHOUSE_DIR)
+  if (process.env.METEOR_WAREHOUSE_DIR) {
     return process.env.METEOR_WAREHOUSE_DIR;
+  }
 
   var warehouseBase = files.inCheckout()
      ? files.getCurrentToolsDir() : files.getHomeDir();
@@ -178,8 +179,9 @@ _.extend(exports.Tropohouse.prototype, {
       escapedPackages = files.readdir(packageRootDir);
     } catch (e) {
       // No packages at all? We're done.
-      if (e.code === 'ENOENT')
+      if (e.code === 'ENOENT') {
         return;
+      }
       throw e;
     }
 
@@ -233,14 +235,16 @@ _.extend(exports.Tropohouse.prototype, {
         versions = files.readdir(packageDir);
       } catch (e) {
         // Somebody put a file in here or something? Whatever, ignore.
-        if (e.code === 'ENOENT' || e.code === 'ENOTDIR')
+        if (e.code === 'ENOENT' || e.code === 'ENOTDIR') {
           return;
+        }
         throw e;
       }
       _.each(versions, function (version) {
         // Is this a pre-0.9.0 "warehouse" version with a hash name?
-        if (/^[a-f0-9]{3,}$/.test(version))
+        if (/^[a-f0-9]{3,}$/.test(version)) {
           return;
+        }
 
         // Skip the currently-latest tool (ie, don't break top-level meteor
         // symlink). This includes both the symlink with its name and the thing
@@ -271,10 +275,12 @@ _.extend(exports.Tropohouse.prototype, {
   //    archinfo.host().
   installed: function (options) {
     var self = this;
-    if (!options.packageName)
+    if (!options.packageName) {
       throw Error("Missing required argument: packageName");
-    if (!options.version)
+    }
+    if (!options.version) {
       throw Error("Missing required argument: version");
+    }
     var architectures = options.architectures || [archinfo.host()];
 
     var downloaded = self._alreadyDownloaded({
@@ -287,27 +293,6 @@ _.extend(exports.Tropohouse.prototype, {
     });
   },
 
-  // Contacts the package server, downloads and extracts a tarball for a given
-  // buildRecord into a temporary directory, whose path is returned.
-  //
-  // XXX: Error handling.
-  _downloadBuildToTempDir: function (versionInfo, buildRecord) {
-    var url = buildRecord.build.url;
-
-    // XXX: We use one progress for download & untar; this isn't ideal:
-    // it relies on extractTarGz being fast and not reporting any progress.
-    // Really, we should create two subtasks
-    // (and, we should stream the download to the tar extractor)
-    var packageTarball = httpHelpers.getUrl({
-      url: url,
-      encoding: null,
-      progress: buildmessage.getCurrentProgressTracker(),
-      wait: false
-    });
-
-    return exports._extractAndConvert(packageTarball);
-  },
-
   // Given a package name and version, returns the architectures for
   // which we have downloaded this package
   //
@@ -317,10 +302,12 @@ _.extend(exports.Tropohouse.prototype, {
     var self = this;
     var packageName = options.packageName;
     var version = options.version;
-    if (!options.packageName)
+    if (!options.packageName) {
       throw Error("Missing required argument: packageName");
-    if (!options.version)
+    }
+    if (!options.version) {
       throw Error("Missing required argument: version");
+    }
 
 
     // Figure out what arches (if any) we have loaded for this package version
@@ -387,12 +374,15 @@ _.extend(exports.Tropohouse.prototype, {
     var self = this;
     buildmessage.assertInJob();
 
-    if (!options.packageName)
+    if (!options.packageName) {
       throw Error("Missing required argument: packageName");
-    if (!options.version)
+    }
+    if (!options.version) {
       throw Error("Missing required argument: version");
-    if (!options.architectures)
+    }
+    if (!options.architectures) {
       throw Error("Missing required argument: architectures");
+    }
 
     var packageName = options.packageName;
     var version = options.version;
@@ -460,8 +450,9 @@ _.extend(exports.Tropohouse.prototype, {
             // (ie, this is a warehouse package not a tropohouse package). But
             // the versions should not overlap: warehouse versions are truncated
             // SHAs whereas tropohouse versions should be semver-like.
-            if (e.code !== 'ENOENT')
+            if (e.code !== 'ENOENT') {
               throw e;
+            }
           }
 
           // If there's already a package in the tropohouse, start with it.
@@ -475,35 +466,65 @@ _.extend(exports.Tropohouse.prototype, {
         // XXX how does concurrency work here?  we could just get errors if we
         // try to rename over the other thing?  but that's the same as in
         // warehouse?
-        _.each(buildsToDownload, function (build) {
-          buildmessage.enterJob({
+        _.each(buildsToDownload, ({ build: { url }}) => {
+          const packageTarball = buildmessage.enterJob({
             title: "downloading " + packageName + "@" + version + "..."
-          }, function() {
+          }, () => {
             try {
-              var buildTempDir = self._downloadBuildToTempDir(
-                { packageName: packageName, version: version }, build);
+              // Override the download domain name and protocol if METEOR_WAREHOUSE_URLBASE
+              // provided.
+              if (process.env.METEOR_WAREHOUSE_URLBASE) {
+                url = url.replace(
+                  /^[a-zA-Z]+:\/\/[^\/]+/,
+                  process.env.METEOR_WAREHOUSE_URLBASE
+                );
+              }
+
+              return httpHelpers.getUrlWithResuming({
+                url: url,
+                encoding: null,
+                progress: buildmessage.getCurrentProgressTracker(),
+                wait: false
+              });
+
             } catch (e) {
-              if (!(e instanceof files.OfflineError))
+              if (! (e instanceof files.OfflineError)) {
                 throw e;
+              }
               buildmessage.error(e.error.message);
             }
+          });
+
+          if (buildmessage.jobHasMessages()) {
+            return;
+          }
+
+          buildmessage.enterJob({
+            title: "extracting " + packageName + "@" + version + "..."
+          }, () => {
+            const buildTempDir = exports._extractAndConvert(packageTarball);
             buildInputDirs.push(buildTempDir);
             buildTempDirs.push(buildTempDir);
           });
         });
-        if (buildmessage.jobHasMessages())
+
+        if (buildmessage.jobHasMessages()) {
           return;
+        }
 
-        // We need to turn our builds into a single isopack.
-        var isopack = new Isopack();
-        _.each(buildInputDirs, function (buildTempDir, i) {
-          isopack._loadUnibuildsFromPath(
-            packageName,
-            buildTempDir,
-            {firstIsopack: i === 0});
+        buildmessage.enterJob({
+          title: "loading " + packageName + "@" + version + "..."
+        }, () => {
+          // We need to turn our builds into a single isopack.
+          var isopack = new Isopack();
+          _.each(buildInputDirs, (buildTempDir, i) => {
+            isopack._loadUnibuildsFromPath(packageName, buildTempDir, {
+              firstIsopack: i === 0,
+            });
+          });
+
+          self._saveIsopack(isopack, packageName, version);
         });
-
-        self._saveIsopack(isopack, packageName, version);
 
         // Delete temp directories now (asynchronously).
         _.each(buildTempDirs, function (buildTempDir) {
@@ -538,8 +559,9 @@ _.extend(exports.Tropohouse.prototype, {
     var downloader;
     var downloaders = [];
     packageMap.eachPackage(function (packageName, info) {
-      if (info.kind !== 'versioned')
+      if (info.kind !== 'versioned') {
         return;
+      }
       buildmessage.enterJob(
         "checking for " + packageName + "@" + info.version,
         function () {
@@ -552,19 +574,22 @@ _.extend(exports.Tropohouse.prototype, {
             downloaders = null;
             return;
           }
-          if (downloader && downloaders)
+          if (downloader && downloaders) {
             downloaders.push(downloader);
+          }
         }
       );
     });
 
     // Did anything fail? Don't download anything.
-    if (! downloaders)
+    if (! downloaders) {
       return;
+    }
 
     // Nothing to download? Great.
-    if (! downloaders.length)
+    if (! downloaders.length) {
       return;
+    }
 
     // Just one package to download? Use a good message.
     if (downloaders.length === 1) {

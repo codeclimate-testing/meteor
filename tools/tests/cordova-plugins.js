@@ -1,6 +1,7 @@
 var selftest = require('../tool-testing/selftest.js');
 var Sandbox = selftest.Sandbox;
 var files = require('../fs/files.js');
+import { execFileSync } from '../utils/processes.js';
 var _ = require('underscore');
 
 // Copy the contents of one file to another.  In these series of tests, we often
@@ -17,9 +18,6 @@ var copyFile = function(from, to, sand) {
   sand.write(to, contents);
 };
 
-var localCordova = files.pathJoin(files.getDevBundle(), 'lib/node_modules/cordova/bin/cordova');
-
-
 // Given a sandbox, that has the app as its currend cwd, read the versions file
 // and read the plugins list.
 //
@@ -28,7 +26,7 @@ var getCordovaPluginsList = function(sand) {
   var env = files.currentEnvWithPathsAdded(files.getCurrentNodeBinDir());
   env.METEOR_WAREHOUSE_DIR = sand.warehouse;
 
-  var lines = selftest.execFileSync(localCordova, ['plugins'],
+  var lines = execFileSync('cordova', ['plugins'],
     {
       cwd: files.pathJoin(sand.cwd, '.meteor', 'local', 'cordova-build'),
       env: env
@@ -54,7 +52,9 @@ var checkCordovaPlugins = selftest.markStack(function(sand, plugins) {
 
   var i = 0;
   _.each(cordovaPlugins, function(line) {
-    if (!line || line === '') return;
+    if (!line || line === '') {
+      return;
+    }
     // XXX should check for the version as well?
     selftest.expectEqual(line.split(' ')[0], plugins[i]);
     i++;
@@ -67,7 +67,9 @@ var checkCordovaPluginExists = selftest.markStack(function(sand, plugin) {
   var cordovaPlugins = getCordovaPluginsList(sand);
   var found = false;
   cordovaPlugins = cordovaPlugins.map(function (line) {
-    if (line && line !== '') return line.split(' ')[0];
+    if (line && line !== '') {
+      return line.split(' ')[0];
+    }
   });
   selftest.expectTrue(_.contains(cordovaPlugins, plugin));
 });
@@ -88,7 +90,9 @@ var checkUserPlugins = function(sand, plugins) {
   var lines = sand.read(".meteor/cordova-plugins").split("\n");
   var depend = {};
   _.each(lines, function(line) {
-    if (!line) return;
+    if (!line) {
+      return;
+    }
     // plugins are stored of the form foo@1.0.0, so this should give us an
     // array [foo, 1.0.0].
     var split = line.split('@');
@@ -113,7 +117,7 @@ var checkUserPlugins = function(sand, plugins) {
 var startAppOnAndroidEmulator = function (s) {
   var run = s.run("run", "android");
   // Building and running the app on the Android Emulator can take a long time.
-  run.waitSecs(240);
+  run.waitSecs(60);
   run.match("Started app on Android Emulator");
   return run;
 }
@@ -138,6 +142,7 @@ selftest.define("change cordova plugins", ["cordova"], function () {
   run = s.run();
   run.match("myapp");
   run.match("proxy");
+  run.waitSecs(30);
   run.match("MongoDB");
   run.match("your app");
   run.match("running at");
@@ -153,7 +158,7 @@ selftest.define("change cordova plugins", ["cordova"], function () {
 
   // Introduce an error.
   s.cp('packages/contains-cordova-plugin/package3.js', 'packages/contains-cordova-plugin/package.js');
-  run.match("exact version");
+  run.match("valid version");
 
   // Fix the error.
   s.cp('packages/contains-cordova-plugin/package2.js', 'packages/contains-cordova-plugin/package.js');

@@ -1,10 +1,9 @@
 Package.describe({
   summary: "Run tests noninteractively, with results going to the console.",
-  version: '1.0.7'
+  version: '1.0.15'
 });
 
 Package.onUse(function (api) {
-
   api.use(['tinytest', 'underscore', 'random', 'ejson', 'check']);
   api.use('http', 'server');
 
@@ -15,4 +14,6 @@ Package.onUse(function (api) {
 
   // This is to be run by phantomjs, not as part of normal package code.
   api.addAssets('runner.js', 'server');
+
+  api.export('runTests');
 });
